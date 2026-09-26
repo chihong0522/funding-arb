@@ -4,20 +4,32 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 router = APIRouter(tags=["scanner"])
 
 # Ensure the server's main module is importable for the broadcast helper.
 _SERVER_DIR = Path(__file__).resolve().parent.parent
-if str(_SERVER_DIR) not in sys.path:
-    sys.path.insert(0, str(_SERVER_DIR))
+_SCRIPTS_DIR = _SERVER_DIR.parent / "scripts"
+for _import_dir in (_SERVER_DIR, _SCRIPTS_DIR):
+    if str(_import_dir) not in sys.path:
+        sys.path.insert(0, str(_import_dir))
+
+from market.carry_scanner_config import (
+    DEFAULT_HORIZON_HOURS,
+    DEFAULT_NOTIONAL_USD,
+    MAX_HORIZON_HOURS,
+    MAX_NOTIONAL_USD,
+    validate_scan_inputs,
+)
 
 # ---------------------------------------------------------------------------
 # Try importing scanners; fall back to None if unavailable.
@@ -66,8 +78,13 @@ _scanning_strategies: set[str] = set()
 # Strategy config helpers (thresholds + venues from Settings)
 # ---------------------------------------------------------------------------
 
-# Carry / Unified need spot + borrow → CEX only.
-CARRY_VENUES = ["binance", "bitget", "bybit", "okx"]
+# Carry scanner phase 3 is same-venue and forward-only; unified/pure scanners
+# keep their separate venue configuration.
+CARRY_VENUES = ["binance", "bybit"]
+CARRY_DEFAULT_NOTIONAL_USD = DEFAULT_NOTIONAL_USD
+CARRY_MAX_NOTIONAL_USD = MAX_NOTIONAL_USD
+CARRY_DEFAULT_HORIZON_HOURS = DEFAULT_HORIZON_HOURS
+CARRY_MAX_HORIZON_HOURS = MAX_HORIZON_HOURS
 # Pure futures: any venue with a funding provider. Defaults are CEX-only;
 # DEX venues (hyperliquid / aster / lighter / edgex) opt-in via venue selector.
 PURE_DEFAULT_VENUES = ["binance", "bitget", "bybit", "okx"]
@@ -103,6 +120,56 @@ def _venue_sets_match(requested: list[str], cached: list[str] | None) -> bool:
     if not cached:
         return False
     return set(requested) == set(cached)
+
+
+def _find_cached_carry_candidate(
+    scan_snapshot_id: str, candidate_snapshot_id: str
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Resolve an open request only against the exact server-cached scan row."""
+    if not scan_snapshot_id or not candidate_snapshot_id:
+        return None
+    matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for block in _carry_results:
+        if not isinstance(block, dict) or block.get("snapshot_id") != scan_snapshot_id:
+            continue
+        candidates = block.get("forward")
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("snapshot_id") == candidate_snapshot_id
+            ):
+                matches.append((block, candidate))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _revise_carry_candidate_identity(
+    candidate: dict[str, Any], fee_assumptions: dict[str, Any]
+) -> dict[str, Any]:
+    """Bind a repriced candidate identity to its market snapshot and economics."""
+    revised = dict(candidate)
+    market_snapshot_id = revised.get("market_snapshot_id") or revised.get("snapshot_id")
+    if not isinstance(market_snapshot_id, (str, int)) or isinstance(market_snapshot_id, bool):
+        raise ValueError("carry candidate has no stable market snapshot identity")
+    revised["market_snapshot_id"] = market_snapshot_id
+    estimate = {
+        key: value
+        for key, value in revised.items()
+        if key not in {"snapshot_id", "market_snapshot_id", "economics_revision_id"}
+    }
+    payload = {
+        "market_snapshot_id": market_snapshot_id,
+        "fee_assumptions": fee_assumptions,
+        "estimate": estimate,
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    revision_id = hashlib.sha256(encoded).hexdigest()
+    revised["economics_revision_id"] = revision_id
+    revised["snapshot_id"] = revision_id
+    return revised
 
 
 def _scan_thresholds() -> tuple[float, float, float]:
@@ -203,12 +270,66 @@ def _recalc_carry_fees(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             out.append(block)
             continue
         venue = str(block.get("venue", ""))
+        policy = _fee_policy()
+        policy["mode"] = "vip_tier"  # carry snapshots never query private fee APIs
         spot = resolve_venue_fee(venue, leg="spot", policy=policy)
         fut = resolve_venue_fee(venue, leg="futures", policy=policy)
         spot_pct = float(spot["taker_pct"])
         fut_pct = float(fut["taker_pct"])
         two_leg = spot_pct + fut_pct
         nb = dict(block)
+        if int(block.get("schema_version", 0) or 0) >= 3:
+            from market.carry_scanner import reprice_candidate  # noqa: E402
+
+            tier = policy.get("venue_tiers", {}).get(venue) or spot.get("tier") or fut.get("tier")
+            fee_assumptions = {
+                "mode": "vip_tier",
+                "spot_taker_fee_pct": spot_pct,
+                "perp_taker_fee_pct": fut_pct,
+                "two_leg_taker_fee_pct": two_leg,
+                "fees_are_taker": True,
+                "fee_application": "entry and exit on each spot/perpetual leg",
+                "source": "static_vip_tier_assumption",
+                "spot_source": spot.get("source"),
+                "futures_source": fut.get("source"),
+                "tier": tier,
+                "spot_tier": spot.get("tier") or tier,
+                "futures_tier": fut.get("tier") or tier,
+                "private_fee_api_used": False,
+            }
+            rows = [
+                _revise_carry_candidate_identity(
+                    {
+                        **reprice_candidate(row, spot_fee_pct=spot_pct, perp_fee_pct=fut_pct),
+                        "fee_assumptions": fee_assumptions,
+                    },
+                    fee_assumptions,
+                )
+                for row in block.get("forward", [])
+            ]
+            rows.sort(key=lambda row: -float(row.get("net_horizon_earnings_usd", 0) or 0))
+            nb["forward"] = rows
+            nb["forward_candidates"] = rows
+            nb["reverse"] = []
+            nb["spot_fee_pct"] = round(spot_pct, 4)
+            nb["futures_fee_pct"] = round(fut_pct, 4)
+            nb["two_leg_fee_pct"] = round(two_leg, 4)
+            nb["fee_source"] = "static_vip_tier_assumption"
+            nb["fee_tier"] = policy.get("venue_tiers", {}).get(venue)
+            assumptions = dict(block.get("assumptions") or {})
+            assumptions.update({
+                "spot_taker_fee_pct": spot_pct,
+                "perp_taker_fee_pct": fut_pct,
+                "fees_are_taker": True,
+                "private_fee_api_used": False,
+                "source": "static_vip_tier_assumption",
+                "tier": tier,
+                "fee_application": "entry and exit on each spot/perpetual leg",
+            })
+            nb["assumptions"] = assumptions
+            nb["fee_assumptions"] = fee_assumptions
+            out.append(nb)
+            continue
         nb["spot_fee_pct"] = round(spot_pct, 4)
         nb["futures_fee_pct"] = round(fut_pct, 4)
         nb["two_leg_fee_pct"] = round(two_leg, 4)
@@ -509,6 +630,14 @@ async def scanner_trigger(
     venues: str | None = Query(
         None, description="Comma-separated venue ids (overrides saved scan_venues)"
     ),
+    notional_usd: Annotated[
+        float,
+        Query(gt=0, le=CARRY_MAX_NOTIONAL_USD, allow_inf_nan=False),
+    ] = CARRY_DEFAULT_NOTIONAL_USD,
+    horizon_hours: Annotated[
+        float,
+        Query(gt=0, le=CARRY_MAX_HORIZON_HOURS, allow_inf_nan=False),
+    ] = CARRY_DEFAULT_HORIZON_HOURS,
 ):
     """Trigger a scan for the specified strategy."""
     global \
@@ -519,12 +648,16 @@ async def scanner_trigger(
         _unified_results, \
         _unified_ts
 
-    # When called directly from Python (background loop / scan-all) instead of
-    # via HTTP, unsupplied params arrive as FastAPI Query objects — normalize.
     if not isinstance(strategy, str):
         strategy = "pure"
     if not isinstance(venues, str):
         venues = None
+    try:
+        notional_usd, horizon_hours = validate_scan_inputs(
+            notional_usd, horizon_hours
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if strategy in _scanning_strategies:
         return {"success": False, "error": "Scan already in progress"}
@@ -574,12 +707,16 @@ async def scanner_trigger(
                 return {"success": False, "error": "Cash-and-carry scanner unavailable"}
 
             # Scan each venue in parallel via thread pool
-            # Carry needs spot + borrow — drop perp-only venues (HL/aster/lighter)
-            carry_venues = [
-                v
-                for v in _parse_venue_list(venues, CARRY_VENUES)
-                if v in CARRY_VENUES
-            ] or list(CARRY_VENUES)
+            # Phase-3 carry is forward-only: same-venue spot plus USDT linear perp.
+            requested_carry_venues = _parse_venue_list(venues, CARRY_VENUES)
+            carry_venues = [v for v in requested_carry_venues if v in CARRY_VENUES]
+            if not carry_venues:
+                if venues is not None:
+                    return {
+                        "success": False,
+                        "error": f"Carry scanner supports only: {', '.join(CARRY_VENUES)}",
+                    }
+                carry_venues = list(CARRY_VENUES)
 
             def _scan_one_carry(v: str) -> dict[str, Any]:
                 try:
@@ -590,13 +727,38 @@ async def scanner_trigger(
                         universe_min=min_edge,
                         max_workers=8,
                         fee_policy=_fee_policy(),
+                        notional_usd=float(notional_usd),
+                        horizon_hours=float(horizon_hours),
                     )
-                    # Simplify: keep only forward/reverse candidates + metadata
+                    # Keep legacy forward/reverse keys while attaching the
+                    # phase-3 executable snapshot and all fail-closed reasons.
                     return {
                         "venue": v,
+                        "direction": "forward_only",
+                        "schema_version": r.get("schema_version", 3),
                         "total_pairs": r.get("total_pairs", 0),
+                        "intersection_pairs": r.get("intersection_pairs", 0),
                         "forward": r.get("forward_candidates", []),
-                        "reverse": r.get("reverse_candidates", []),
+                        "forward_candidates": r.get("forward_candidates", []),
+                        "near_forward": r.get("near_forward", []),
+                        "reverse": [],
+                        "excluded": r.get("excluded", []),
+                        "exclusion_counts": r.get("exclusion_counts", {}),
+                        "assumptions": r.get("assumptions", {}),
+                        "notional_usd": r.get("notional_usd", float(notional_usd)),
+                        "max_notional_usd": r.get("max_notional_usd", CARRY_MAX_NOTIONAL_USD),
+                        "horizon_hours": r.get("horizon_hours", float(horizon_hours)),
+                        "max_horizon_hours": r.get("max_horizon_hours", CARRY_MAX_HORIZON_HOURS),
+                        "disclaimer": r.get("disclaimer"),
+                        "timestamp_ms": r.get("timestamp_ms"),
+                        "completed_at_ms": r.get("completed_at_ms"),
+                        "snapshot_id": r.get("snapshot_id"),
+                        "instrument_snapshots": r.get("instrument_snapshots", {}),
+                        "instrument_snapshot_observation_times_ms": r.get(
+                            "instrument_snapshot_observation_times_ms", {}
+                        ),
+                        "funding_observation_min_ms": r.get("funding_observation_min_ms"),
+                        "funding_observation_max_ms": r.get("funding_observation_max_ms"),
                         "spot_fee_pct": r.get("spot_fee_pct", 0),
                         "futures_fee_pct": r.get("futures_fee_pct", 0),
                         "two_leg_fee_pct": r.get("two_leg_fee_pct", 0),
@@ -604,7 +766,16 @@ async def scanner_trigger(
                         "fee_tier": r.get("fee_tier"),
                     }
                 except Exception as e:
-                    return {"venue": v, "error": str(e), "forward": [], "reverse": []}
+                    return {
+                        "venue": v,
+                        "direction": "forward_only",
+                        "error": str(e),
+                        "forward": [],
+                        "forward_candidates": [],
+                        "reverse": [],
+                        "excluded": [{"symbol": "*", "reason": "scan_failed", "detail": str(e)}],
+                        "exclusion_counts": {"scan_failed": 1},
+                    }
 
             def _scan_all_carry() -> list[dict[str, Any]]:
                 # Venues scan concurrently — each one already parallelizes its own IO

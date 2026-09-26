@@ -76,6 +76,7 @@ class BinanceFundingProvider(FundingProvider):
 
     def fetch_all(self, quote: str = "USDT") -> list[dict[str, Any]]:
         data = _http_get_with_retry(f"{self.BASE}/fapi/v1/premiumIndex")
+        observed_at_ms = int(time.time() * 1000)
         out: list[dict[str, Any]] = []
         for row in data if isinstance(data, list) else [data]:
             sym = str(row.get("symbol", ""))
@@ -88,6 +89,7 @@ class BinanceFundingProvider(FundingProvider):
                     "next_funding_ts": int(row.get("nextFundingTime", 0) or 0),
                     "mark_price": float(row.get("markPrice", 0.0) or 0.0),
                     "index_price": float(row.get("indexPrice", 0.0) or 0.0),
+                    "observed_at_ms": int(row.get("time", 0) or observed_at_ms),
                 }
             )
         return out
@@ -98,24 +100,18 @@ class BinanceFundingProvider(FundingProvider):
         if isinstance(data, list):
             data = data[0]
         next_ts = int(data.get("nextFundingTime", 0) or 0)
-        interval_ms = _DEFAULT_INTERVAL_MS
-        try:
-            info = _http_get_with_retry(f"{self.BASE}/fapi/v1/fundingInfo")
-            for row in info if isinstance(info, list) else []:
-                if str(row.get("symbol", "")).upper() == symbol.upper():
-                    hrs = float(row.get("fundingIntervalHours", 8) or 8)
-                    interval_ms = int(hrs * 60 * 60 * 1000)
-                    break
-        except Exception:
-            pass
-        last_settle_ts = next_ts - interval_ms if next_ts else 0
+        interval_h = self.fetch_interval_map("USDT").get(symbol.upper())
+        interval_ms = int(interval_h * 60 * 60 * 1000) if interval_h else 0
+        last_settle_ts = next_ts - interval_ms if next_ts and interval_ms else 0
         return {
             "rate_pct": float(data.get("lastFundingRate", 0.0) or 0.0) * 100,
             "last_settle_ts": last_settle_ts,
             "next_funding_ts": next_ts,
             "interval_ms": interval_ms,
+            "interval_h": interval_h,
             "mark_price": float(data.get("markPrice", 0.0) or 0.0),
             "index_price": float(data.get("indexPrice", 0.0) or 0.0),
+            "observed_at_ms": int(data.get("time", 0) or time.time() * 1000),
         }
 
     def fetch_since(
@@ -145,18 +141,42 @@ class BinanceFundingProvider(FundingProvider):
         return out
 
     def fetch_interval_map(self, quote: str = "USDT") -> dict[str, float]:
-        try:
-            info = _http_get_with_retry(f"{self.BASE}/fapi/v1/fundingInfo")
-        except Exception:
-            return {}
+        """Resolve normal 8h USDT-M cadence plus Funding Info overrides.
+
+        Binance's public ``fundingInfo`` endpoint reports symbols whose
+        funding parameters were adjusted; ``exchangeInfo`` supplies the full
+        active USDT-M perpetual universe. Request failures are propagated so
+        callers can fail closed instead of silently assuming an interval.
+        """
+        info = _http_get_with_retry(f"{self.BASE}/fapi/v1/fundingInfo")
+        exchange = _http_get_with_retry(f"{self.BASE}/fapi/v1/exchangeInfo")
         if not isinstance(info, list):
-            return {}
-        return {
-            str(row.get("symbol", "")).upper(): float(
-                row.get("fundingIntervalHours", 8) or 8
-            )
-            for row in info
+            raise RuntimeError("Binance fundingInfo response is malformed")
+        symbols = exchange.get("symbols") if isinstance(exchange, dict) else None
+        if not isinstance(symbols, list):
+            raise RuntimeError("Binance exchangeInfo response is malformed")
+        quote_u = quote.upper()
+        intervals = {
+            str(row.get("symbol", "")).upper(): 8.0
+            for row in symbols
+            if row.get("symbol")
+            and row.get("status") == "TRADING"
+            and row.get("contractType") == "PERPETUAL"
+            and str(row.get("quoteAsset", "")).upper() == quote_u
+            and str(row.get("marginAsset", quote_u)).upper() == quote_u
         }
+        for row in info:
+            symbol = str(row.get("symbol", "")).upper()
+            if symbol not in intervals:
+                continue
+            try:
+                hours = float(row.get("fundingIntervalHours"))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"Binance funding interval missing for {symbol}") from exc
+            if hours <= 0:
+                raise RuntimeError(f"Binance funding interval invalid for {symbol}")
+            intervals[symbol] = hours
+        return intervals
 
 
 class BitgetFundingProvider(FundingProvider):
@@ -254,15 +274,79 @@ class BitgetFundingProvider(FundingProvider):
 class BybitFundingProvider(FundingProvider):
     venue_id = "bybit"
     BASE = "https://api.bybit.com"
+    _INSTRUMENT_CACHE_TTL_SEC = 60.0
+
+    def __init__(self) -> None:
+        self._instrument_cache: tuple[float, list[dict[str, Any]]] | None = None
+
+    def _fetch_linear_instruments(self) -> list[dict[str, Any]]:
+        """Read linear instrument metadata; fundingInterval is in minutes."""
+        now = time.time()
+        if self._instrument_cache and now - self._instrument_cache[0] < self._INSTRUMENT_CACHE_TTL_SEC:
+            return self._instrument_cache[1]
+        import urllib.parse
+
+        rows: list[dict[str, Any]] = []
+        cursor = ""
+        seen: set[str] = set()
+        for _ in range(20):
+            params = {"category": "linear", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            url = f"{self.BASE}/v5/market/instruments-info?{urllib.parse.urlencode(params)}"
+            payload = _http_get_with_retry(url)
+            if not isinstance(payload, dict) or int(payload.get("retCode", 0) or 0) != 0:
+                raise RuntimeError("Bybit linear instrument metadata request failed")
+            result = payload.get("result") or {}
+            page = result.get("list") or []
+            if not isinstance(page, list):
+                raise RuntimeError("Bybit linear instrument list is malformed")
+            rows.extend(row for row in page if isinstance(row, dict))
+            next_cursor = str(result.get("nextPageCursor") or "")
+            if not next_cursor:
+                self._instrument_cache = (now, rows)
+                return rows
+            if next_cursor in seen:
+                raise RuntimeError("Bybit linear instrument cursor did not advance")
+            seen.add(next_cursor)
+            cursor = next_cursor
+        raise RuntimeError("Bybit linear instrument pagination exceeded safety limit")
+
+    def fetch_interval_map(self, quote: str = "USDT") -> dict[str, float]:
+        """Return actual USDT linear funding intervals from instrument metadata."""
+        out: dict[str, float] = {}
+        quote_u = quote.upper()
+        for row in self._fetch_linear_instruments():
+            symbol = str(row.get("symbol", "")).upper()
+            if (
+                not symbol
+                or row.get("status") != "Trading"
+                or row.get("contractType") != "LinearPerpetual"
+                or str(row.get("quoteCoin", "")).upper() != quote_u
+                or str(row.get("settleCoin", "")).upper() != quote_u
+            ):
+                continue
+            interval_raw = row.get("fundingInterval")
+            if interval_raw is None:
+                continue
+            try:
+                interval_minutes = float(interval_raw)
+            except (TypeError, ValueError):
+                continue
+            if interval_minutes > 0:
+                out[symbol] = interval_minutes / 60.0
+        return out
 
     def fetch_all(self, quote: str = "USDT") -> list[dict[str, Any]]:
         url = f"{self.BASE}/v5/market/tickers?category=linear"
         payload = _http_get_with_retry(url)
-        rows = (
-            payload.get("result", {}).get("list", [])
-            if isinstance(payload, dict)
-            else []
-        )
+        if not isinstance(payload, dict) or int(payload.get("retCode", 0) or 0) != 0:
+            raise RuntimeError("Bybit linear ticker request failed")
+        observed_at_ms = int(payload.get("time", 0) or time.time() * 1000)
+        result = payload.get("result")
+        rows = result.get("list") if isinstance(result, dict) else None
+        if not isinstance(rows, list):
+            raise RuntimeError("Bybit linear ticker list is malformed")
         out: list[dict[str, Any]] = []
         quote_u = quote.upper()
         for row in rows:
@@ -280,6 +364,7 @@ class BybitFundingProvider(FundingProvider):
                         row.get("markPrice", row.get("lastPrice", 0)) or 0
                     ),
                     "index_price": float(row.get("indexPrice", 0) or 0),
+                    "observed_at_ms": observed_at_ms,
                 }
             )
         return out
@@ -291,53 +376,80 @@ class BybitFundingProvider(FundingProvider):
         row = (payload.get("result", {}).get("list") or [{}])[0]
         rate = float(row.get("fundingRate", 0) or 0) * 100
         next_ts = int(row.get("nextFundingTime", 0) or 0)
-        interval_ms = _DEFAULT_INTERVAL_MS
-        last_settle_ts = next_ts - interval_ms if next_ts else 0
+        interval_h = self.fetch_interval_map("USDT").get(sym)
+        interval_ms = int(interval_h * 60 * 60 * 1000) if interval_h else 0
+        last_settle_ts = next_ts - interval_ms if next_ts and interval_ms else 0
         return {
             "rate_pct": rate,
             "last_settle_ts": last_settle_ts,
             "next_funding_ts": next_ts,
             "interval_ms": interval_ms,
+            "interval_h": interval_h,
             "mark_price": float(row.get("markPrice", row.get("lastPrice", 0)) or 0),
             "index_price": float(row.get("indexPrice", 0) or 0),
+            "observed_at_ms": int(payload.get("time", 0) or time.time() * 1000),
         }
 
     def fetch_since(
         self, symbol: str, start_ms: int, max_pages: int = 10
     ) -> list[dict[str, Any]]:
-        if start_ms <= 0:
+        """Read Bybit's newest-first funding history using endTime pagination.
+
+        V5 funding history is time-window paginated rather than cursor-paginated.
+        Each full page is followed with an ``endTime`` just before its oldest
+        settlement; rows are deduplicated and returned oldest-first.
+        """
+        if start_ms <= 0 or max_pages <= 0:
             return []
-        sym = symbol.upper()
-        out: list[dict[str, Any]] = []
-        cursor: str | None = None
+        import urllib.parse
+
+        symbol_u = symbol.upper()
+        out_by_ts: dict[int, dict[str, Any]] = {}
+        end_time: int | None = None
         for _ in range(max_pages):
-            url = (
-                f"{self.BASE}/v5/market/funding/history"
-                f"?category=linear&symbol={sym}&limit=200"
-            )
-            if cursor:
-                url += f"&cursor={cursor}"
+            params: dict[str, str | int] = {
+                "category": "linear",
+                "symbol": symbol_u,
+                "limit": 200,
+            }
+            if end_time is not None:
+                params["endTime"] = end_time
+            url = f"{self.BASE}/v5/market/funding/history?{urllib.parse.urlencode(params)}"
             payload = _http_get_with_retry(url)
-            result = payload.get("result", {}) if isinstance(payload, dict) else {}
-            rows = result.get("list", [])
+            if not isinstance(payload, dict) or int(payload.get("retCode", 0) or 0) != 0:
+                raise RuntimeError("Bybit funding history request failed")
+            result = payload.get("result") or {}
+            rows = result.get("list")
+            if not isinstance(rows, list):
+                raise RuntimeError("Bybit funding history list is malformed")
             if not rows:
                 break
+
+            page_timestamps: list[int] = []
             for row in rows:
-                ts = int(row.get("fundingRateTimestamp", 0) or 0)
-                if ts <= start_ms:
+                try:
+                    ts = int(row.get("fundingRateTimestamp", 0) or 0)
+                    rate = float(row.get("fundingRate"))
+                except (TypeError, ValueError, AttributeError):
                     continue
-                out.append(
-                    {
-                        "ts": ts,
-                        "rate_pct": float(row.get("fundingRate", 0) or 0) * 100,
-                    }
-                )
-            cursor = result.get("nextPageCursor")
-            if not cursor:
+                if ts <= 0:
+                    continue
+                page_timestamps.append(ts)
+                if ts > start_ms and (end_time is None or ts <= end_time):
+                    out_by_ts[ts] = {"ts": ts, "rate_pct": rate * 100.0}
+
+            if not page_timestamps:
+                raise RuntimeError("Bybit funding history page has no valid timestamps")
+            oldest_ts = min(page_timestamps)
+            if oldest_ts <= start_ms or len(rows) < 200:
                 break
+            next_end_time = oldest_ts - 1
+            if next_end_time <= 0 or next_end_time == end_time:
+                break
+            end_time = next_end_time
             time.sleep(0.15)
-        out.sort(key=lambda x: x["ts"])
-        return out
+
+        return [out_by_ts[ts] for ts in sorted(out_by_ts)]
 
 
 class OkxFundingProvider(FundingProvider):

@@ -52,6 +52,9 @@ def test_run_once_shape(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr("core.strategy_config.STRATEGY_CONFIG_PATH", cfg_file)
+    monkeypatch.setattr(
+        "execution.run_pure_futures_spread.JOURNAL_PATH", tmp_path / "journal.jsonl"
+    )
 
     cfg = json.loads(
         json.dumps(

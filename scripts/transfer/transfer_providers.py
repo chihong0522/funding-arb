@@ -9,6 +9,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.credentials import redact_secret_values
+from core.execution_policy import block_real_execution
 from transfer.chain_aliases import native_chain, to_canonical
 
 
@@ -67,6 +69,7 @@ class TransferProvider:
 
     def prepare_for_withdraw(self, coin: str, amount: float) -> list[str]:
         """Aggregate funds to the withdrawable account (e.g. futures->spot). Returns execution step descriptions."""
+        block_real_execution("transfer preparation")
         return []
 
     def withdraw(
@@ -77,6 +80,7 @@ class TransferProvider:
         address: str,
         tag: str = "",
     ) -> WithdrawResult:
+        block_real_execution("withdrawal")
         raise NotImplementedError
 
     def fetch_deposit_records(
@@ -160,6 +164,7 @@ class BitgetTransferProvider(TransferProvider):
         return _safe_float(data.get(coin.upper()))
 
     def prepare_for_withdraw(self, coin: str, amount: float) -> list[str]:
+        block_real_execution("transfer preparation")
         from venues.bitget import BitgetSpotVenue
 
         v = BitgetSpotVenue()
@@ -191,6 +196,7 @@ class BitgetTransferProvider(TransferProvider):
         address: str,
         tag: str = "",
     ) -> WithdrawResult:
+        block_real_execution("withdrawal")
         from venues.bitget import _api_call
 
         body: dict[str, Any] = {
@@ -210,10 +216,10 @@ class BitgetTransferProvider(TransferProvider):
                     ok=True, order_id=oid, message="submitted", raw=data
                 )
             return WithdrawResult(
-                ok=False, message=str(data.get("msg", data)), raw=data
+                ok=False, message=redact_secret_values(data.get("msg", data)), raw=data
             )
         except Exception as e:
-            return WithdrawResult(ok=False, message=str(e))
+            return WithdrawResult(ok=False, message=redact_secret_values(e))
 
     def fetch_deposit_records(
         self,
@@ -328,6 +334,7 @@ class BybitTransferProvider(TransferProvider):
         return _safe_float(bals.get(coin.upper()))
 
     def prepare_for_withdraw(self, coin: str, amount: float) -> list[str]:
+        block_real_execution("transfer preparation")
         # Bybit UTA can usually withdraw directly; tries UNIFIED internal transfer if insufficient (rarely needed)
         return []
 
@@ -339,6 +346,7 @@ class BybitTransferProvider(TransferProvider):
         address: str,
         tag: str = "",
     ) -> WithdrawResult:
+        block_real_execution("withdrawal")
         from venues.bybit import _api_call
 
         body: dict[str, Any] = {
@@ -360,10 +368,10 @@ class BybitTransferProvider(TransferProvider):
                     ok=True, order_id=oid, message="submitted", raw=data
                 )
             return WithdrawResult(
-                ok=False, message=str(data.get("retMsg", data)), raw=data
+                ok=False, message=redact_secret_values(data.get("retMsg", data)), raw=data
             )
         except Exception as e:
-            return WithdrawResult(ok=False, message=str(e))
+            return WithdrawResult(ok=False, message=redact_secret_values(e))
 
     def fetch_deposit_records(
         self,
@@ -411,7 +419,7 @@ class OkxTransferProvider(TransferProvider):
                 "GET", "/api/v5/asset/currencies", params={"ccy": coin.upper()}
             )
         except Exception as e:
-            print(f"[okx] fetch currencies failed: {e}", file=sys.stderr)
+            print(f"[okx] fetch currencies failed: {redact_secret_values(e)}", file=sys.stderr)
             return []
         out: list[ChainRoute] = []
         for ch in data.get("data") or []:
@@ -473,6 +481,7 @@ class OkxTransferProvider(TransferProvider):
         return _safe_float(bals.get(coin.upper()))
 
     def prepare_for_withdraw(self, coin: str, amount: float) -> list[str]:
+        block_real_execution("transfer preparation")
         from venues.okx import _api_call
 
         steps: list[str] = []
@@ -503,7 +512,7 @@ class OkxTransferProvider(TransferProvider):
             )
             steps.append(f"okx: internal transfer {coin} {xfer:.4f} for withdraw")
         except Exception as e:
-            steps.append(f"okx: prepare_for_withdraw skipped ({e})")
+            steps.append(f"okx: prepare_for_withdraw skipped ({redact_secret_values(e)})")
         return steps
 
     def withdraw(
@@ -514,6 +523,7 @@ class OkxTransferProvider(TransferProvider):
         address: str,
         tag: str = "",
     ) -> WithdrawResult:
+        block_real_execution("withdrawal")
         from venues.okx import _api_call
 
         body: dict[str, Any] = {
@@ -534,10 +544,10 @@ class OkxTransferProvider(TransferProvider):
                     ok=True, order_id=oid, message="submitted", raw=data
                 )
             return WithdrawResult(
-                ok=False, message=str(data.get("msg", data)), raw=data
+                ok=False, message=redact_secret_values(data.get("msg", data)), raw=data
             )
         except Exception as e:
-            return WithdrawResult(ok=False, message=str(e))
+            return WithdrawResult(ok=False, message=redact_secret_values(e))
 
     def fetch_deposit_records(
         self,
@@ -632,6 +642,7 @@ class BinanceTransferProvider(TransferProvider):
         return _safe_float(v.fetch_balances([coin.upper()]).get(coin.upper()))
 
     def prepare_for_withdraw(self, coin: str, amount: float) -> list[str]:
+        block_real_execution("transfer preparation")
         from venues.binance import BinanceSpotVenue
 
         steps: list[str] = []
@@ -657,6 +668,7 @@ class BinanceTransferProvider(TransferProvider):
         address: str,
         tag: str = "",
     ) -> WithdrawResult:
+        block_real_execution("withdrawal")
         from venues.binance import _api_call
 
         params: dict[str, Any] = {
@@ -674,7 +686,7 @@ class BinanceTransferProvider(TransferProvider):
             oid = str(data.get("id", ""))
             return WithdrawResult(ok=True, order_id=oid, message="submitted", raw=data)
         except Exception as e:
-            return WithdrawResult(ok=False, message=str(e))
+            return WithdrawResult(ok=False, message=redact_secret_values(e))
 
 
 _PROVIDERS: dict[str, TransferProvider] = {

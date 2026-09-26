@@ -1,14 +1,7 @@
 name: TG Funding Push
 
 on:
-  # Hourly cadence is driven by an external cron-job.org task that POSTs to
-  # GitHub's workflow_dispatch API (see docs/*/serverless-pipeline.md).
-  # GitHub's built-in schedule: cron is unreliable for low-activity public
-  # repos (observed 3–6h gaps with silently skipped runs).
-  #
-  # Set inputs.source=cron in the cron-job.org POST body so telegram_push.py
-  # receives --skip-if-unchanged (anti-spam). Manual "Run workflow" keeps
-  # source=manual (default) and always posts — useful for debugging.
+  # Hourly cadence is driven by the external workflow_dispatch caller.
   workflow_dispatch:
     inputs:
       source:
@@ -16,167 +9,335 @@ on:
         type: choice
         required: false
         default: manual
-        options:
-          - manual
-          - cron
+        options: [manual, cron]
       min_edge:
-        description: "Minimum net edge % (e.g. 0.05)"
+        description: "Minimum net edge %"
+        type: number
         required: false
-        default: "0.0"
+        default: 0
       top_n:
-        description: "How many top spreads to publish"
+        description: "How many top spreads to publish (1–100)"
+        type: number
         required: false
-        default: "10"
+        default: 10
       include_dex:
-        description: "Include perp DEX venues (hyperliquid/aster/lighter/edgex/dydx)"
+        description: "Include perp DEX venues in the public snapshot"
         type: boolean
         required: false
         default: true
 
-# Grant the in-built GITHUB_TOKEN write access so we can push the snapshot
-# to the orphan `gh-pages` branch without needing a separate PAT.
+# The default token is read-only. Only the isolated publisher job can write.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  # Only one pipeline run at a time per branch; in-flight runs are cancelled
-  # so we never publish a stale snapshot out of order.
   group: tg-funding-push
   cancel-in-progress: true
 
 jobs:
-  push:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-
-      # Minimal runtime deps — scanner uses requests + stdlib only.
-      # The optional venue SDKs are NOT needed for scan-only mode.
-      - name: Install deps
+      # Python has no reviewed hash lock yet. Install only the scanner's HTTP
+      # dependency on this disposable runner; no secrets are present in this job.
+      - name: Install scanner dependency
+        run: python -m pip install requests
+      - name: Validate dispatch inputs
+        env:
+          MIN_EDGE: ${{ inputs.min_edge }}
+          TOP_N: ${{ inputs.top_n }}
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install requests
+          set -euo pipefail
+          python - "$MIN_EDGE" "$TOP_N" <<'PY'
+          import math
+          import re
+          import sys
 
-      # ----------------------------------------------------------------
-      # Step 0 — Fetch last cycle's snapshot for dedup (best-effort)
-      # ----------------------------------------------------------------
-      # The previous run committed scanner-latest.json to gh-pages; pull it so
-      # the push can tag 🆕/📈/📉 and skip posting when nothing moved. Missing
-      # branch / file is fine — the push silently disables dedup.
+          min_edge, top_n = sys.argv[1:]
+          if not re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", min_edge):
+              raise SystemExit("min_edge must be a decimal number")
+          if not math.isfinite(float(min_edge)):
+              raise SystemExit("min_edge must be finite")
+          if not re.fullmatch(r"[1-9][0-9]*", top_n) or int(top_n) > 100:
+              raise SystemExit("top_n must be an integer from 1 through 100")
+          PY
       - name: Fetch previous snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/git-askpass" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+          chmod 700 "$RUNNER_TEMP/git-askpass"
+          export GIT_ASKPASS="$RUNNER_TEMP/git-askpass"
+          export GIT_TERMINAL_PROMPT=0
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
             git fetch --no-tags --depth=1 origin gh-pages
-            git show origin/gh-pages:scanner-latest.json > /tmp/prev-snapshot.json \
-              2>/dev/null || true
+            git show FETCH_HEAD:scanner-latest.json > /tmp/prev-snapshot.json 2>/dev/null || true
           fi
+      # Format the message with no Telegram credentials. A separate job sends
+      # this data artifact using only the Python standard library.
+      - name: Prepare Telegram digest artifact
+        env:
+          MIN_EDGE: ${{ inputs.min_edge }}
+          TOP_N: ${{ inputs.top_n }}
+          SOURCE: ${{ inputs.source }}
+          INCLUDE_DEX: ${{ inputs.include_dex }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--dry-run --min-edge "$MIN_EDGE" --top "$TOP_N" --prev-snapshot /tmp/prev-snapshot.json)
+          if [[ "$SOURCE" == "cron" ]]; then args+=(--skip-if-unchanged); fi
+          if [[ "$INCLUDE_DEX" == "true" ]]; then args+=(--include-dex); fi
+          python scripts/notify/telegram_push.py "${args[@]}" > /tmp/telegram-dry-run.txt
+          python - /tmp/telegram-dry-run.txt /tmp/telegram-digest.json <<'PY'
+          import ast
+          import json
+          import re
+          import sys
+          from pathlib import Path
 
-      # ----------------------------------------------------------------
-      # Step 1 — Telegram broadcast (top-N digest)
-      # ----------------------------------------------------------------
-      - name: Push digest to Telegram
+          output = Path(sys.argv[1]).read_text(encoding="utf-8")
+          marker = "[dry-run] Would post "
+          messages = []
+          cursor = 0
+          while True:
+              start = output.find(marker, cursor)
+              if start < 0:
+                  break
+              header_end = output.find("\n", start)
+              if header_end < 0:
+                  raise SystemExit("incomplete dry-run message header")
+              match = re.fullmatch(r"\[dry-run\] Would post ([0-9]+) chars:", output[start:header_end])
+              if not match:
+                  raise SystemExit("invalid dry-run message header")
+              length = int(match.group(1))
+              message_start = header_end + 1
+              message_end = message_start + length
+              message = output[message_start:message_end]
+              if len(message) != length:
+                  raise SystemExit("incomplete dry-run message")
+              messages.append(message)
+              cursor = message_end
+
+          markup_match = re.search(r"(?m)^\[dry-run\] buttons: (.+)$", output)
+          markup = ast.literal_eval(markup_match.group(1)) if markup_match else None
+          if markup is not None and not isinstance(markup, dict):
+              raise SystemExit("invalid Telegram reply markup")
+          Path(sys.argv[2]).write_text(
+              json.dumps({"messages": messages, "reply_markup": markup}, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          PY
+      - name: Build demo snapshot
+        env:
+          MIN_EDGE: ${{ inputs.min_edge }}
+          INCLUDE_DEX: ${{ inputs.include_dex }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--out /tmp/scanner-latest.json --top 30 --min-edge "$MIN_EDGE")
+          if [[ "$INCLUDE_DEX" == "true" ]]; then args+=(--include-dex); fi
+          python scripts/notify/snapshot_to_pages.py "${args[@]}"
+      - name: Upload Telegram digest artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: telegram-digest
+          path: /tmp/telegram-digest.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload snapshot artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scanner-snapshot
+          path: /tmp/scanner-latest.json
+          if-no-files-found: error
+          retention-days: 1
+
+  notify:
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: telegram-digest
+          path: artifact
+      # No checkout, package installation, or project code runs with bot secrets.
+      - name: Send prepared digest
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python scripts/notify/telegram_push.py \
-            --min-edge "${{ github.event.inputs.min_edge || '0.0' }}" \
-            --top "${{ github.event.inputs.top_n || '10' }}" \
-            --prev-snapshot /tmp/prev-snapshot.json \
-            ${{ github.event.inputs.source == 'cron' && '--skip-if-unchanged' || '' }} \
-            ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.include_dex == 'true') && '--include-dex' || '' }}
-
-      # ----------------------------------------------------------------
-      # Step 2 — Snapshot for the Vercel demo (commit to gh-pages orphan)
-      # ----------------------------------------------------------------
-      # Always runs — even if Telegram secrets aren't set, the demo site
-      # should still refresh. Telegram skips itself gracefully when the
-      # secrets are missing (see telegram_push.py).
-      - name: Build demo snapshot
-        run: |
-          python scripts/notify/snapshot_to_pages.py \
-            --out /tmp/scanner-latest.json \
-            --top 30 \
-            --min-edge "${{ github.event.inputs.min_edge || '0.0' }}" \
-            ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.include_dex == 'true') && '--include-dex' || '' }}
-
-      - name: Publish snapshot to gh-pages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
 
-          # Configure the bot identity for the orphan branch commit.
-          git config user.name  "github-actions[bot]"
+          path = Path("artifact/telegram-digest.json")
+          try:
+              digest = json.loads(path.read_text(encoding="utf-8"))
+              messages = digest["messages"]
+              markup = digest.get("reply_markup")
+              if not isinstance(messages, list) or len(messages) > 100:
+                  raise ValueError("invalid message list")
+              if any(not isinstance(message, str) or not 1 <= len(message) <= 4096 for message in messages):
+                  raise ValueError("invalid message text")
+              if markup is not None:
+                  buttons = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+                  expected = [[
+                      {"text": "📊 Dashboard", "url": "https://funding-arb-drab.vercel.app"},
+                      {"text": "📈 Carry", "url": "https://funding-arb-drab.vercel.app/?strategy=carry"},
+                      {"text": "🔀 Unified", "url": "https://funding-arb-drab.vercel.app/?strategy=unified"},
+                  ]]
+                  if buttons != expected:
+                      raise ValueError("unexpected dashboard links")
+          except Exception as exc:
+              print(f"Digest validation failed: {type(exc).__name__}", file=sys.stderr)
+              raise SystemExit(1)
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          if not token or not chat_id or not messages:
+              raise SystemExit(0)
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          for index, message in enumerate(messages):
+              payload = {
+                  "chat_id": chat_id,
+                  "text": message,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": True,
+              }
+              if markup and index == len(messages) - 1:
+                  payload["reply_markup"] = markup
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                  headers={"Content-Type": "application/json"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      if response.status != 200 or not json.load(response).get("ok"):
+                          raise ValueError("Telegram rejected the message")
+              except Exception as exc:
+                  print(f"Telegram send failed: {type(exc).__name__}", file=sys.stderr)
+                  raise SystemExit(1)
+              if index + 1 < len(messages):
+                  time.sleep(0.5)
+          PY
+
+  publish:
+    needs: notify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: scanner-snapshot
+          path: artifact
+      # This job consumes snapshot data only: it installs no packages and runs
+      # no project scripts. The write token is used only for git authentication.
+      - name: Publish snapshot to gh-pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s artifact/scanner-latest.json
+          test "$(stat -c '%s' artifact/scanner-latest.json)" -le 1048576
+          python -m json.tool artifact/scanner-latest.json >/dev/null
+          cat > "$RUNNER_TEMP/git-askpass" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+          chmod 700 "$RUNNER_TEMP/git-askpass"
+          export GIT_ASKPASS="$RUNNER_TEMP/git-askpass"
+          export GIT_TERMINAL_PROMPT=0
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Save the freshly built snapshot before we touch git state.
-          cp /tmp/scanner-latest.json /tmp/scanner-latest.json.bak
-
-          # Fetch gh-pages (orphan branch) and switch to it so the commit
-          # actually lands on gh-pages, not main. Using `git checkout <path>`
-          # (the old approach) only populated the worktree without moving HEAD,
-          # so commits silently went to main and `git push origin gh-pages`
-          # reported "Everything up-to-date" (no-op).
-          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
             git fetch --no-tags --depth=1 origin gh-pages
             git checkout -B gh-pages FETCH_HEAD
           else
             git checkout --orphan gh-pages
           fi
-
-          # Wipe the worktree clean — gh-pages should only ever hold the
-          # snapshot + README, nothing else.
+          # The orphan branch intentionally contains only the snapshot and docs.
           git rm -rf --quiet . 2>/dev/null || true
-
-          # Restore the new snapshot.
-          cp /tmp/scanner-latest.json.bak ./scanner-latest.json
+          cp artifact/scanner-latest.json ./scanner-latest.json
           cat > README.md <<'EOF'
           # gh-pages — Vercel demo snapshot
 
-          This orphan branch holds a single file, `scanner-latest.json`, refreshed
-          hourly by the `TG Funding Push` GitHub Actions workflow. The Vercel
-          dashboard fetches it directly from raw.githubusercontent.com (5-min
-          edge cache) — see
-          [`docs/zh-CN/serverless-pipeline.md`](../main/docs/zh-CN/serverless-pipeline.md)
-          for the full architecture.
+          This orphan branch holds the public scanner snapshot, refreshed by the
+          TG Funding Push workflow. The Vercel dashboard fetches it from
+          raw.githubusercontent.com; see the main branch serverless-pipeline docs.
 
-          Do **not** open PRs against this branch.
+          Do not open pull requests against this branch.
           EOF
-
-          # Vercel project Root Directory is `web/`. gh-pages has no app to build —
-          # only scanner-latest.json at repo root for raw.githubusercontent.com.
-          # Place a stub web/vercel.json so Vercel sees deploymentEnabled:false and
-          # skips Preview builds (avoids hourly "deployment failed" emails).
           mkdir -p web
           cat > web/vercel.json <<'VZEOF'
           {
             "$schema": "https://openapi.vercel.sh/vercel.json",
-            "git": {
-              "deploymentEnabled": false
-            }
+            "git": { "deploymentEnabled": false }
           }
           VZEOF
-
           git add scanner-latest.json README.md web/vercel.json
           git commit --allow-empty -m "chore(demo): refresh scanner snapshot [skip ci]"
           git push origin gh-pages
 
-      # ----------------------------------------------------------------
-      # Step 3 — Alert on any prior step failure (scan / TG / gh-pages)
-      # ----------------------------------------------------------------
+  alert-on-failure:
+    needs: [scan, notify, publish]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
       - name: Alert on failure
-        if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
         run: |
-          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then exit 0; fi
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="⚠️ TG Funding Push failed — https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          set -euo pipefail
+          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then exit 0; fi
+          curl --fail --silent --show-error \
+            --config <(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TELEGRAM_BOT_TOKEN") \
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+            --data-urlencode "text=TG Funding Push failed — https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}"

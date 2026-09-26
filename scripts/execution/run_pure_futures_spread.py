@@ -24,6 +24,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from cli.scan_pure_futures_spreads import scan_pure_futures_spreads  # noqa: E402
+from core.execution_policy import require_dry_run  # noqa: E402
 from core.strategy_config import (  # noqa: E402
     apply_strategy_to_pure_futures_cfg,
     load_strategy_config,
@@ -106,6 +107,7 @@ def run_once(cfg: dict[str, Any], *, verbose: bool = False) -> dict[str, Any]:
     allow_mismatch = bool(pfa.get("allowSettleMismatch", False))
     workers = int(pfa.get("workers", 4))
     dry_run = _dry_run(cfg)
+    require_dry_run(dry_run, "pure-futures runner")
     min_edge, min_edge_1h, min_edge_mismatch = strategy_edge_thresholds(strat)
     row_min_edge = min_edge_for_row_factory(min_edge, min_edge_1h, min_edge_mismatch)
     fee_policy = strategy_fee_policy(strat)

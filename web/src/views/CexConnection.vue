@@ -7,7 +7,7 @@ import {
 } from '@/composables/useApi'
 import { useI18n } from 'vue-i18n'
 import { VenueConnectGroupGrid } from '@/components/connection'
-import { CEX_VENUE_RANK } from '@/constants/venueOrder'
+import { CEX_VENUE_RANK, SUPPORTED_CEX_UI_VENUES } from '@/constants/venueOrder'
 
 const { t } = useI18n()
 const message = useMessage()
@@ -17,13 +17,8 @@ const walletStatus = getWalletStatus()
 const tradingMode = getTradingMode()
 
 const walletForms = reactive<Record<string, Record<string, string>>>({})
-const showManualEntry = reactive<Record<string, boolean>>({})
 
-const CEX_VENUES = [...CEX_VENUE_RANK]
-
-function extInfo(_venue: string) {
-  return { supported: false, detected: false, connected: false, connecting: false, address: '', balance: 0, error: null }
-}
+const CEX_VENUES = [...SUPPORTED_CEX_UI_VENUES]
 
 function venueMeta(venueId: string) {
   return venues.data.value?.find((v) => v.id === venueId)
@@ -32,14 +27,6 @@ function venueMeta(venueId: string) {
 function formFor(venue: string): Record<string, string> {
   if (!walletForms[venue]) walletForms[venue] = {}
   return walletForms[venue]
-}
-
-function toggleManualEntry(venue: string) {
-  showManualEntry[venue] = !showManualEntry[venue]
-}
-
-function defaultManualOpen(_venue: string): boolean {
-  return true
 }
 
 async function handleConnect(venue: string) {
@@ -95,7 +82,6 @@ onMounted(async () => {
         if (ws.live_flag) { form[ws.live_flag] = '' }
         walletForms[vid] = form
       }
-      if (showManualEntry[vid] === undefined) showManualEntry[vid] = defaultManualOpen(vid)
     }
   }
 })
@@ -128,15 +114,11 @@ onMounted(async () => {
           :venue-ids="CEX_VENUES"
           :rank-order="CEX_VENUE_RANK"
           :schemas="walletSchemas.data.value"
-          :is-cex="true"
           :loading="walletSchemas.loading.value"
           :form-for="formFor"
-          :show-manual-for="(v) => showManualEntry[v] !== false"
-          :ext-for="extInfo"
           :meta-for="venueMeta"
           :status-for="(v) => walletStatus.data.value?.[v]"
           :schema-for="(v) => walletSchemas.data.value?.[v]"
-          @toggle-manual="toggleManualEntry"
           @connect="handleConnect"
           @disconnect="handleDisconnect"
           @toggle-live="handleToggleLive"

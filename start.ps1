@@ -69,7 +69,7 @@ function Install-PythonDeps {
 function Install-NodeDeps {
     if (-not (Test-Path "web\node_modules")) {
         Write-Host "  -> Installing Node.js dependencies..." -ForegroundColor Cyan
-        Set-Location web; npm install; Set-Location ..
+        Set-Location web; npm ci; Set-Location ..
     }
     Write-Host "  [OK] Node.js dependencies ready" -ForegroundColor Green
 }

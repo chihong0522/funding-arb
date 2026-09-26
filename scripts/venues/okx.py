@@ -17,15 +17,15 @@ import urllib.request
 from typing import Any, Optional
 
 from core.config import resolve_timeframes
+from core.credentials import ensure_env, redact_secret_values
+from core.execution_policy import block_real_execution, require_dry_run
 from venues.http_util import (
-    credentials_file,
     http_get_json,
     parse_kline_ohlcv,
     rules_for_price,
 )
 
 BASE = "https://www.okx.com"
-CONFIG_PATH = credentials_file()
 _symbol_rules_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _futures_rules_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _initialized_symbols: set[str] = set()
@@ -39,16 +39,7 @@ def _ensure_env() -> None:
     global _env_loaded
     if _env_loaded:
         return
-    if os.environ.get("OKX_API_KEY"):
-        _env_loaded = True
-        return
-    try:
-        with open(CONFIG_PATH) as f:
-            for k, v in json.load(f).get("env", {}).items():
-                if v and k not in os.environ:
-                    os.environ[k] = str(v)
-    except (OSError, json.JSONDecodeError):
-        pass
+    ensure_env("OKX_")
     _env_loaded = True
 
 
@@ -77,11 +68,13 @@ def _sign(timestamp: str, method: str, path: str, body: str) -> str:
 def _api_call(
     method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None
 ) -> dict:
+    if method.upper() != "GET":
+        block_real_execution("OKX REST write")
     key, secret, passp = _get_key(), _get_secret(), _get_pass()
     if not (key and secret and passp):
         raise RuntimeError(
             "OKX API credentials missing: please set OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE, "
-            "or configure them in ~/.funding-arb/credentials.json under env."
+            "in an approved secure credential store."
         )
 
     query = urllib.parse.urlencode(params) if params else ""
@@ -114,11 +107,11 @@ def _api_call(
                 )
             return data
         except Exception as e:
-            last_err = e
+            last_err = RuntimeError(redact_secret_values(e))
             if method == "GET" and attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
                 continue
-            raise
+            raise last_err from None
     raise last_err if last_err else RuntimeError("okx _api_call failed")
 
 
@@ -312,6 +305,7 @@ class OkxSpotVenue:
     def transfer_asset(
         self, asset: str, amount: float, from_account: str, to_account: str
     ) -> bool:
+        block_real_execution("internal transfer")
         # Under all OKX account modes, margin lives in the trading account (18); spot↔margin needs no transfer
         if "margin" in (from_account, to_account):
             return True
@@ -560,7 +554,7 @@ class OkxSpotVenue:
                     if coin in debt:
                         debt[coin] = abs(float(item.get("liab", 0) or 0))
         except Exception as e:
-            print(f"okx fetch_margin_debt balance failed: {e}", file=sys.stderr)
+            print(f"okx fetch_margin_debt balance failed: {redact_secret_values(e)}", file=sys.stderr)
         # In Simple mode, margin liabilities are tracked on MARGIN position's liab/liabCcy
         try:
             pos = _api_call(
@@ -572,11 +566,12 @@ class OkxSpotVenue:
                 if coin in debt:
                     debt[coin] += liab
         except Exception as e:
-            print(f"okx fetch_margin_debt positions failed: {e}", file=sys.stderr)
+            print(f"okx fetch_margin_debt positions failed: {redact_secret_values(e)}", file=sys.stderr)
         return debt
 
     def _margin_borrow_repay(self, asset: str, amount: float, side: str) -> bool:
         """POST /api/v5/account/spot-manual-borrow-repay (only applicable when Spot mode has borrowing enabled)."""
+        block_real_execution("margin borrow/repay")
         try:
             _api_call(
                 "POST",
@@ -589,10 +584,11 @@ class OkxSpotVenue:
             )
             return True
         except Exception as e:
-            print(f"okx margin {side} {asset} failed: {e}", file=sys.stderr)
+            print(f"okx margin {side} {asset} failed: {redact_secret_values(e)}", file=sys.stderr)
             return False
 
     def margin_borrow(self, asset: str, amount: float) -> bool:
+        block_real_execution("margin borrow")
         cfg = self._get_account_config()
         lv = str(cfg.get("acctLv", ""))
         if lv in ("3", "4"):
@@ -605,6 +601,7 @@ class OkxSpotVenue:
         return self._margin_borrow_repay(asset, amount, "borrow")
 
     def margin_repay(self, asset: str, amount: float) -> bool:
+        block_real_execution("margin repayment")
         cfg = self._get_account_config()
         lv = str(cfg.get("acctLv", ""))
         if lv in ("3", "4"):
@@ -624,13 +621,8 @@ class OkxSpotVenue:
         ref_price: float = 0.0,
         side_effect: str = "",
     ) -> tuple[bool, dict[str, Any]]:
-        """Cross margin order (tdMode=cross).
-
-        acctLv=2 Simple mode: requires ccy=margin coin; sell orders implicitly borrow, buy closing automatically repays principal and interest.
-        acctLv=3/4: depends on set-auto-loan / set-auto-repay.
-        sell uses market order (sz=base); buy uses IOC limit order (px with 1% buffer), because
-        MARGIN market buy has ambiguous sz unit and tgtCcy only applies to SPOT market orders.
-        """
+        """Margin order submission is disabled at the global execution boundary."""
+        block_real_execution("margin order")
         cfg = self._get_account_config()
         acct_lv = str(cfg.get("acctLv", ""))
         se = side_effect.lower()
@@ -703,7 +695,7 @@ class OkxSpotVenue:
                 "order_status": state,
             }
         except Exception as e:
-            return False, {"error": str(e)}
+            return False, {"error": redact_secret_values(e)}
 
     def fetch_borrow_rates(self, coins: list[str]) -> dict[str, float]:
         """Fetch annualized borrow rates (decimal). Public bulk endpoint, rate is daily rate."""
@@ -771,7 +763,7 @@ class OkxSpotVenue:
                 "order_status": od.get("state", ""),
             }
         except Exception as e:
-            return False, {"error": str(e)}
+            return False, {"error": redact_secret_values(e)}
 
     def place_sell(
         self,
@@ -824,7 +816,7 @@ class OkxSpotVenue:
                 "order_status": od.get("state", ""),
             }
         except Exception as e:
-            return False, {"error": str(e)}
+            return False, {"error": redact_secret_values(e)}
 
     def place_futures_order(
         self,
@@ -890,7 +882,7 @@ class OkxSpotVenue:
                 "order_status": "filled",
             }
         except Exception as e:
-            return False, {"error": str(e)}
+            return False, {"error": redact_secret_values(e)}
 
     def execute_trades(
         self,
@@ -898,6 +890,7 @@ class OkxSpotVenue:
         market: dict[str, dict[str, Any]],
         dry_run: bool,
     ) -> list[dict[str, Any]]:
+        require_dry_run(dry_run, "OKX order execution")
         results: list[dict[str, Any]] = []
         for trade in trades:
             symbol = trade["symbol"]

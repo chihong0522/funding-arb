@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Pure Futures Watcher — standalone daemon monitoring pure perp pair positions.
+"""Pure Futures Watcher — paper-only daemon monitoring perp pair positions.
 
-Responsibilities:
-  1. Spread collapse exit: auto-close when funding spread <= exitThreshold
-  2. Rebalance: alert on leg notional value skew; autoRebalance=true trims
-     oversized leg on quantity mismatch (real delta exposure from partial liquidation/ADL)
-  3. Single-leg liquidation detection: when one leg is liquidated or abnormally closed, immediately close the other
+Real auto-close, rebalancing, and recovery writes are disabled by the shared
+execution policy. The watcher can report observed positions and spreads only.
 
 Usage:
   python3 scripts/execution/pure_futures_watcher.py \
@@ -14,9 +11,7 @@ Usage:
   python3 scripts/execution/pure_futures_watcher.py \
     --config templates/config.pure_futures.spread.json --interval 30 --verbose
 
-Difference from runner:
-  - Runner is a periodic scan->decide->execute loop (open + close)
-  - Watcher is a pure monitoring process (only exit/hedge/alert), suitable as a systemd/launchd daemon
+The runner and watcher remain paper-only; neither can submit live writes.
 """
 
 from __future__ import annotations
@@ -35,6 +30,8 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from cli.scan_pure_futures_spreads import fetch_all_fee_rate_rows_by_base  # noqa: E402
+from core.credentials import redact_secret_values  # noqa: E402
+from core.execution_policy import require_dry_run  # noqa: E402
 from core.notify import send_notification  # noqa: E402
 from core.strategy_config import apply_strategy_to_pure_futures_cfg  # noqa: E402
 from execution.pure_futures_executor import (  # noqa: E402
@@ -104,7 +101,7 @@ def _fetch_positions_from_venue(
         v = _get_venue_cached(venue_id)
         return v.fetch_futures_positions(quote)
     except Exception as e:
-        print(f"[{_ts_str()}] {venue_id} fetch positions error: {e}", file=sys.stderr)
+        print(f"[{_ts_str()}] {venue_id} fetch positions error: {redact_secret_values(e)}", file=sys.stderr)
         return None
 
 
@@ -400,6 +397,7 @@ def watch_cycle(
     log_path: Path = WATCHER_LOG,
 ) -> dict[str, Any]:
     """Single watch cycle: check all open positions, decide exit/alert."""
+    require_dry_run(dry_run, "pure-futures watcher")
     pfa = cfg.get("pureFuturesArbitrage") or {}
     venues = [
         str(v).lower() for v in pfa.get("venues", ["binance", "bitget", "bybit", "okx"])
@@ -756,7 +754,7 @@ def main() -> int:
             print(f"\n[{_ts_str()}] Watcher stopped.", file=sys.stderr)
             break
         except Exception as e:
-            print(f"[{_ts_str()}] Watcher error: {e}", file=sys.stderr)
+            print(f"[{_ts_str()}] Watcher error: {redact_secret_values(e)}", file=sys.stderr)
             time.sleep(60)
 
     return 0

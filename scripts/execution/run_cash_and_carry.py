@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Cash and carry & cross-asset arbitrage execution framework.
+"""Cash-and-carry planner and paper execution engine.
 
-This engine unifies forward and reverse delta-neutral trades, performing global
-asset selection based on funding rates and executing them defensively.
-
-Live Execution relies on `delta_neutral_executor.py` for atomic transfers and rollback.
-It periodically syncs real NAV using `fetch_live_state`.
+Real orders, transfers, borrowing, and repayment writes are disabled by the
+shared execution policy; the cycle remains available only in dry-run mode.
 """
 
 from __future__ import annotations
@@ -44,6 +41,8 @@ from backtest.funding_providers import (  # noqa: E402
     get_funding_provider,
 )
 from core.config import resolve_config_path, runs_base, strategy_dir  # noqa: E402
+from core.credentials import redact_secret_values  # noqa: E402
+from core.execution_policy import block_real_execution, require_dry_run  # noqa: E402
 from core.file_lock import lock_exclusive, unlock  # noqa: E402
 from core.notify import send_notification  # noqa: E402
 from execution.delta_neutral_executor import execute_delta_neutral_trades  # noqa: E402
@@ -131,17 +130,10 @@ def disable_reverse(cfg: dict[str, Any]) -> None:
 
 
 def apply_live_safety(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Live safety gate: Reverse C&C requires margin borrow/repay, must have explicit enableReverseArbitrage to proceed.
-
-    Even if explicitly enabled, run_cycle will also verify the venue implements borrow/repay capability
-    (supports_reverse_arbitrage); venues that don't support it are force-disabled in live mode.
-    """
+    """Reject a live request rather than silently relabeling it as paper."""
     if cfg.get("dry_run", True):
         return cfg
-    if cfg.get("enableReverseArbitrage", False):
-        return cfg
-    disable_reverse(cfg)
-    return cfg
+    block_real_execution("cash-and-carry cycle")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -398,6 +390,7 @@ def build_funding_snapshots(
 
 def run_cycle(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
     dry_run = bool(cfg.get("dry_run", True))
+    require_dry_run(dry_run, "cash-and-carry cycle")
 
     cash = str(cfg.get("cash", "USDT"))
     venue = get_venue(cfg)
@@ -442,7 +435,7 @@ def run_cycle(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
     except Exception as e:
         return {
             "status": "skipped",
-            "reason": f"Funding rate snapshot fetch failed: {e}, skipping entire cycle",
+            "reason": f"Funding rate snapshot fetch failed: {redact_secret_values(e)}, skipping entire cycle",
         }
     if not asset_list:
         return {

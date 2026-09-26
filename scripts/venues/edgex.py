@@ -35,6 +35,9 @@ import asyncio
 import os
 from typing import Any
 
+from core.credentials import redact_secret_values
+from core.execution_policy import block_real_execution, require_dry_run
+
 from venues.edgex_funding import EdgexFundingProvider
 
 _DEFAULT_BASE_URL = "https://edgex-prod-v2.edgex.exchange"
@@ -258,6 +261,7 @@ class EdgexVenue:
     async def _submit_limit_order(
         self, contract_id: str, size: str, price: str, side: Any
     ) -> Any:
+        block_real_execution("EdgeX order submission")
         client = self._make_client()
         try:
             return await client.create_limit_order(
@@ -278,6 +282,7 @@ class EdgexVenue:
             open_long / close_short → BUY (cross asks, +slippage bound)
             open_short / close_long → SELL (cross bids, −slippage bound)
         """
+        require_dry_run(dry_run, "EdgeX order execution")
         results: list[dict[str, Any]] = []
         for trade in trades:
             symbol = trade["symbol"]
@@ -353,6 +358,6 @@ class EdgexVenue:
             except Exception as e:
                 record["status"] = "failed"
                 record["order_id"] = None
-                record["error"] = str(e)
+                record["error"] = redact_secret_values(e)
             results.append(record)
         return results

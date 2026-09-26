@@ -1,4 +1,12 @@
-# Funding Rate Arbitrage Engine
+# Funding Rate Arbitrage Engine — Paper-only Binance/Bybit Fork
+
+> **Fork status (2026-09-26): security hardening + paper execution + read-only Binance/Bybit forward carry scanning.** Real exchange writes are unconditionally disabled across the supported execution boundary, including orders, borrowing, transfers and withdrawals. API keys or legacy `--live` flags do not enable live trading. Browser-wallet trading is disabled.
+>
+> **Phase 2 is incomplete:** verified exchange reconciliation, live recovery and live execution are not delivered. Durable incident records and fail-closed gates are not a complete recovery engine. Paper fills and snapshot yield estimates are not real trading performance. Jev decision-making and automatic rotation are not integrated.
+>
+> **Scope and safety:** same-venue spot-long/USDT-perpetual-short candidates on Binance and Bybit; illustrative pre-funded 1× short-margin estimates, no borrowing. Scan notional defaults to $100 and is capped at $500; these are engineering limits, not capital authorization. Authenticated controls require an in-memory frontend token and server configuration. No public deployment or real-money readiness is claimed.
+>
+> The remainder of this README describes **upstream functionality and historical usage**. Any live-order, reverse-margin, cross-venue, DEX/wallet or automatic-transfer instructions below are **not supported by this fork's current release**. External demo/channel links belong to the upstream project, not a deployment of this fork. See [fork status](docs/security/fork-status.md) for the authoritative delivery boundary.
 
 Cross-exchange **funding rate** arbitrage: Cash-and-Carry, unified cross-venue carry, and **Pure Futures** (perp–perp) spreads — with a **Vue dashboard**, CLI, and optional **Tauri** desktop shell.
 

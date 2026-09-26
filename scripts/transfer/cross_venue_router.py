@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from transfer.chain_aliases import common_canonicals, native_chain
+from core.execution_policy import require_dry_run
 from transfer.transfer_providers import (
     DepositAddress,
     WithdrawResult,
@@ -257,6 +258,7 @@ def build_plan(
     canonical: str | None = None,
     dry_run: bool = True,
 ) -> TransferPlan | None:
+    require_dry_run(dry_run, "transfer plan execution")
     routes = find_routes(from_venue, to_venue, coin, amount)
     if not routes:
         return None
@@ -280,6 +282,7 @@ def build_plan(
 
 def execute_plan(plan: TransferPlan) -> tuple[list[str], WithdrawResult | None]:
     """Execute transfer plan. Returns (step logs, withdrawal result)."""
+    require_dry_run(plan.dry_run, "cross-venue transfer")
     if plan.dry_run:
         return ["dry_run: skipped execution"], None
 

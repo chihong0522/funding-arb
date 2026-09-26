@@ -1,6 +1,13 @@
 import type { Ref } from "vue";
 import { ref, onUnmounted } from "vue";
 import {
+  apiFetch,
+  getApiToken,
+  getWebSocketProtocols,
+  reportApiAuthFailure,
+  subscribeApiToken,
+} from "@/composables/apiAuth";
+import {
   isDemoMode,
   resolveDemoRoute,
   useDemoSnapshot,
@@ -242,7 +249,7 @@ async function request<T>(url: string): Promise<T> {
       return demoData as T;
     }
   }
-  const response = await fetch(`${API_BASE}${url}`);
+  const response = await apiFetch(`${API_BASE}${url}`);
   if (!response.ok) {
     throw new Error(`API ${response.status}: ${response.statusText}`);
   }
@@ -262,13 +269,21 @@ export async function post<T>(
   url: string,
   body: Record<string, any>,
 ): Promise<T> {
-  const response = await fetch(`${API_BASE}${url}`, {
+  const response = await apiFetch(`${API_BASE}${url}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!response.ok) {
-    throw new Error(`API ${response.status}: ${response.statusText}`);
+    const responseError = await response.json().catch(() => null);
+    const detail = responseError && typeof responseError === "object"
+      ? responseError.detail || responseError.error || responseError.message
+      : null;
+    throw new Error(
+      typeof detail === "string"
+        ? detail
+        : `API ${response.status}: ${response.statusText}`,
+    );
   }
   const json = await response.json();
   if (json && typeof json === "object" && "success" in json && "data" in json) {
@@ -303,6 +318,11 @@ function useApi<T>(url: string, initialData: T | null = null): ApiResponse<T> {
       loading.value = false;
     }
   }
+
+  const unsubscribeToken = subscribeApiToken((token) => {
+    if (token && !isDemoMode) void refresh();
+  });
+  onUnmounted(unsubscribeToken);
 
   return { data, error, loading, refresh };
 }
@@ -347,34 +367,178 @@ export function getResolvedFees() {
   return useApi<ResolvedFees>("/settings/fees");
 }
 
-// ─── Cash-and-Carry types ──────────────────────────────────────────
+// ─── Cash-and-Carry snapshot schema (scripts/market/carry_scanner.py) ──
 
 export interface CarryCand {
+  venue: string;
   base: string;
   symbol: string;
+  direction: "forward" | "reverse";
   rate_pct: number;
-  annual_pct: number;
-  next_ts: number;
+  historical_median_rate_pct?: number;
+  expected_rate_pct?: number;
+  funding_estimator?: string;
+  history_samples?: number;
+  history_first_ts?: number;
+  history_latest_ts?: number;
+  funding_observed_at_ms?: number;
+  snapshot_ts_ms?: number;
+  snapshot_observed_at_ms?: number;
+  next_funding_ts?: number;
   interval_h: number;
+  funding_payments_estimated?: number;
+  horizon_hours?: number;
+  notional_usd_requested?: number;
+  quantity_base?: number;
+  spot_notional_usd?: number;
+  perp_notional_usd?: number;
+  mark_price?: number;
+  spot_entry_vwap?: number;
+  spot_exit_vwap?: number;
+  perp_entry_vwap?: number;
+  perp_exit_vwap?: number;
+  spot_fee_pct?: number;
+  perp_fee_pct?: number;
+  futures_fee_pct?: number;
+  fee_pct?: number;
+  short_margin_multiplier?: number;
+  short_margin_usd?: number;
+  capital_fee_buffer_usd?: number;
+  entry_fee_usd?: number;
+  exit_fee_usd?: number;
+  observed_round_trip_book_cost_usd?: number;
+  exit_slippage_bps_per_leg?: number;
+  exit_slippage_assumption_usd?: number;
+  basis_buffer_bps?: number;
+  basis_buffer_usd?: number;
+  gross_funding_usd?: number;
+  total_estimated_cost_usd?: number;
+  net_horizon_earnings_usd?: number;
+  net_horizon_roi_pct?: number;
+  net_horizon_notional_roi_pct?: number;
+  capital_required_usd?: number;
+  net_horizon_capital_roi_pct?: number;
+  breakeven_rate_pct?: number;
+  breakeven_funding_payments?: number;
+  breakeven_hours_from_snapshot?: number;
+  spot_book_observed_at_ms?: number;
+  perp_book_observed_at_ms?: number;
+  spot_book_source_ts_ms?: number;
+  perp_book_source_ts_ms?: number;
+  spot_book_request_started_at_ms?: number;
+  perp_book_request_started_at_ms?: number;
+  spot_book_snapshot_id?: string | number | null;
+  perp_book_snapshot_id?: string | number | null;
+  spot_instrument_snapshot_observed_at_ms?: number;
+  perp_instrument_snapshot_observed_at_ms?: number;
+  spot_instrument_snapshot_id?: string | number | null;
+  perp_instrument_snapshot_id?: string | number | null;
+  source_timestamp_skew_ms?: number;
+  snapshot_estimate?: boolean;
+  borrowing_used?: boolean;
+  snapshot_id?: string;
+  // Legacy carry fields retained for older cached snapshots.
+  annual_pct?: number;
+  next_ts?: number;
   has_spot?: boolean;
   borrowable?: boolean;
   spot_price?: number;
-  net_edge_pct: number;
-  mark_price?: number;
-  fee_pct?: number;
+  net_edge_pct?: number;
   borrow_daily_pct?: number;
   borrow_annual_pct?: number;
 }
 
+export interface CarryScanAssumptions {
+  spot_taker_fee_pct?: number;
+  perp_taker_fee_pct?: number;
+  fees_are_taker?: boolean;
+  fee_application?: string;
+  source?: string;
+  tier?: string | null;
+  private_fee_api_used?: boolean;
+  funding_rate_estimator?: string;
+  minimum_history_samples?: number;
+  exit_slippage_bps_per_leg?: number;
+  basis_buffer_bps_per_position?: number;
+  maximum_order_book_age_sec?: number;
+  maximum_funding_snapshot_age_sec?: number;
+  maximum_source_timestamp_skew_sec?: number;
+  maximum_instrument_snapshot_age_sec?: number;
+  maximum_history_gap_intervals?: number;
+  capital_model?: string;
+  short_margin_multiplier?: number;
+  borrowing_used?: boolean;
+  capital_fee_buffer_method?: string;
+  leverage_or_live_execution_approved?: boolean;
+  public_market_data_only?: boolean;
+}
+
+export interface CarryExclusion {
+  symbol: string;
+  reason: string;
+  detail?: string;
+}
+
+export interface CarryInstrumentSnapshot {
+  observed_at_ms?: number;
+  snapshot_id?: string | number | null;
+  [key: string]: unknown;
+}
+
 export interface CarryVenue {
+  schema_version?: number;
   venue: string;
-  total_pairs: number;
+  direction?: "forward_only" | string;
+  total_pairs?: number;
+  intersection_pairs?: number;
+  notional_usd?: number;
+  max_notional_usd?: number;
+  horizon_hours?: number;
+  max_horizon_hours?: number;
+  timestamp_ms?: number;
+  scan_started_at_ms?: number;
+  completed_at_ms?: number;
+  snapshot_id?: string;
+  funding_observation_min_ms?: number | null;
+  funding_observation_max_ms?: number | null;
+  instrument_snapshots?: Record<string, CarryInstrumentSnapshot>;
+  instrument_snapshot_observation_times_ms?: Record<string, number | null>;
+  disclaimer?: string;
+  assumptions?: CarryScanAssumptions;
   forward: CarryCand[];
+  forward_candidates?: CarryCand[];
+  near_forward?: CarryCand[];
   reverse: CarryCand[];
+  forward_no_spot?: CarryExclusion[];
+  reverse_candidates?: CarryCand[];
+  reverse_not_borrowable?: CarryExclusion[];
+  excluded?: CarryExclusion[];
+  exclusion_counts?: Record<string, number>;
   spot_fee_pct?: number;
   futures_fee_pct?: number;
   two_leg_fee_pct?: number;
+  fee_source?: string;
+  fee_tier?: string | null;
+  market_data_error?: string;
   error?: string;
+}
+
+export interface CarryPaperOpenRequest {
+  strategy: "carry";
+  base: string;
+  symbol: string;
+  futures_venue: string;
+  spot_venue: string;
+  amount_usd: number;
+  horizon_hours: number;
+  direction: "forward";
+  dry_run: true;
+  scan_snapshot_id: string;
+  candidate_snapshot_id: string;
+}
+
+export function openCarryPaperPosition(request: CarryPaperOpenRequest) {
+  return post("/positions/open", { ...request });
 }
 
 export interface UnifiedCarryCand {
@@ -487,25 +651,30 @@ const _wsState = {
 };
 
 function _wsConnect() {
+  const token = getApiToken();
+  const protocols = getWebSocketProtocols(token);
+  if (!protocols) return;
   if (_wsState.ws && _wsState.ws.readyState <= WebSocket.OPEN) return;
 
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const host = window.location.host;
   const url = `${protocol}//${host}/ws/events`;
+  const ws = new WebSocket(url, protocols);
+  _wsState.ws = ws;
 
-  _wsState.ws = new WebSocket(url);
-
-  _wsState.ws.onopen = () => {
+  ws.onopen = () => {
+    if (_wsState.ws !== ws) return;
     _wsState.connected.value = true;
     _wsState.connectCallbacks.forEach((cb) => cb());
     _wsState.pingTimer = setInterval(() => {
-      if (_wsState.ws?.readyState === WebSocket.OPEN) {
-        _wsState.ws.send("ping");
+      if (_wsState.ws === ws && ws.readyState === WebSocket.OPEN) {
+        ws.send("ping");
       }
     }, 30000);
   };
 
-  _wsState.ws.onmessage = (event) => {
+  ws.onmessage = (event) => {
+    if (_wsState.ws !== ws) return;
     try {
       const msg = JSON.parse(event.data) as WsMessage;
       if (msg.event === "pong") return;
@@ -515,20 +684,51 @@ function _wsConnect() {
     }
   };
 
-  _wsState.ws.onclose = () => {
+  ws.onclose = (event) => {
+    if (_wsState.ws !== ws) return;
+    _wsState.ws = null;
     _wsState.connected.value = false;
     if (_wsState.pingTimer) {
       clearInterval(_wsState.pingTimer);
       _wsState.pingTimer = null;
     }
     _wsState.disconnectCallbacks.forEach((cb) => cb());
-    _wsState.reconnectTimer = setTimeout(() => _wsConnect(), 3000);
+    if (event.code === 4401) {
+      reportApiAuthFailure(401);
+      return;
+    }
+    if (event.code === 1013) {
+      reportApiAuthFailure(503);
+      return;
+    }
+    if (getApiToken()) {
+      _wsState.reconnectTimer = setTimeout(() => _wsConnect(), 3000);
+    }
   };
 
-  _wsState.ws.onerror = () => {
-    _wsState.ws?.close();
+  ws.onerror = () => {
+    if (_wsState.ws === ws) ws.close();
   };
 }
+
+subscribeApiToken((token) => {
+  if (_wsState.reconnectTimer) {
+    clearTimeout(_wsState.reconnectTimer);
+    _wsState.reconnectTimer = null;
+  }
+  if (_wsState.pingTimer) {
+    clearInterval(_wsState.pingTimer);
+    _wsState.pingTimer = null;
+  }
+
+  const previous = _wsState.ws;
+  const wasConnected = _wsState.connected.value;
+  _wsState.ws = null;
+  _wsState.connected.value = false;
+  if (previous && previous.readyState < WebSocket.CLOSING) previous.close();
+  if (wasConnected) _wsState.disconnectCallbacks.forEach((cb) => cb());
+  if (token) _wsConnect();
+});
 
 function _wsDisconnect() {
   // Don't actually disconnect — the shared singleton stays alive as long

@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
-"""Pure futures cross-venue executor — perp + perp funding rate spread arbitrage executor.
+"""Pure futures cross-venue executor for paper simulation and position inspection.
 
-MVP scope:
-  - open: long_venue open_long + short_venue open_short
-  - close: short leg close_short + long leg close_long
-  - dry-run / live share an independent ledger: scripts/data/pure-futures/positions.json
-  - Best-effort rollback on leg failure; naked state if rollback fails, requires manual handling.
-
-Note: Cross-exchange execution has no true atomicity. This module only handles engineering-level
-two-leg rollback and recording; it does not address cross-venue margin migration,
-liquidation monitoring, or funding period mismatch (Phase 2 risk controls)."""
+All real orders are rejected by the shared safety boundary. Transfer, borrowing,
+rollback, and live recovery are unavailable in this build; historical ambiguous
+states remain persisted and block any future live re-enable until verified
+reconciliation is implemented.
+"""
 
 from __future__ import annotations
 
 import json
-import os
 import sys
-import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,13 +22,20 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from core.file_lock import lock_exclusive, unlock  # noqa: E402
+from core.credentials import redact_secret_values  # noqa: E402
 from core.notify import send_notification  # noqa: E402
+from core.execution_policy import block_real_execution, require_dry_run  # noqa: E402
 from execution.cross_venue_executor import (  # noqa: E402
     CrossVenueResult,
     _exec_qty,
     _filled,
     _floor_qty,
     _leg_market,
+)
+from execution.safe_execution import (  # noqa: E402
+    SafeExecutionJournal,
+    execute_journaled_trade,
+    write_json_atomic,
 )
 from venues import get_venue  # noqa: E402
 
@@ -46,40 +47,24 @@ MARGIN_BUFFER = 1.05
 def load_pure_futures_positions(path: Path = POSITIONS_PATH) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+        raise ValueError(f"pure-futures ledger must contain a JSON list of objects: {path}")
+    return data
 
 
 def _save_positions(
     positions: list[dict[str, Any]], path: Path = POSITIONS_PATH
 ) -> None:
-    """Atomic write: write to temp file then rename (crash-safe)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = json.dumps(positions, ensure_ascii=False, separators=(",", ":"))
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent), prefix=".positions-", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-        os.replace(tmp_path, str(path))
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    """Durable atomic write; callers hold the ledger lock."""
+    write_json_atomic(path, positions)
 
 
 def _with_position_lock(path: Path):
     """Acquire exclusive lock on position file for safe concurrent access."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_suffix(".lock")
-    lock_fd = open(lock_path, "w")
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fd = open(lock_path, "a+b")
     try:
         lock_exclusive(lock_fd)
     except BaseException:
@@ -93,6 +78,42 @@ def _record_position(record: dict[str, Any], path: Path = POSITIONS_PATH) -> Non
     try:
         positions = load_pure_futures_positions(path)
         positions.append(record)
+        _save_positions(positions, path)
+    finally:
+        unlock(lock_fd)
+        lock_fd.close()
+
+
+def _persist_recovery_position(
+    position_id: str,
+    path: Path,
+    updates: dict[str, Any],
+) -> None:
+    lock_fd = _with_position_lock(path)
+    try:
+        positions = load_pure_futures_positions(path)
+        for row in positions:
+            if row.get("id") == position_id:
+                row.update(
+                    {
+                        "status": "recovery_required",
+                        "recovery_required": True,
+                        "updated_at": int(time.time() * 1000),
+                        **updates,
+                    }
+                )
+                _save_positions(positions, path)
+                return
+        positions.append(
+            {
+                "id": position_id,
+                "status": "recovery_required",
+                "dry_run": False,
+                "recovery_required": True,
+                "updated_at": int(time.time() * 1000),
+                **updates,
+            }
+        )
         _save_positions(positions, path)
     finally:
         unlock(lock_fd)
@@ -151,46 +172,20 @@ def _venue(venue_id: str, injected: Any = None):
 def _check_futures_margin(
     venue: Any, venue_id: str, quote: str, required_usd: float, logs: list[str]
 ) -> bool:
-    """Verify futures USDT >= required; if insufficient, attempt earn->spot->futures chain.
-
-    Chain: futures low -> transfer from spot -> spot low -> redeem from earn -> transfer again.
-    Returns False if margin is confirmed insufficient (should abort opening).
-    On balance API errors, skip verification (don't block trades on transient API failures).
-    """
+    """Require pre-funded futures balance; never transfer, redeem, borrow, or fail open."""
     try:
         balances = venue.fetch_usdt_account_balances()
-    except Exception as e:
-        logs.append(f"{venue_id}: margin query failed, skipping check ({e})")
-        return True
-    futures_avail = float(balances.get("futures", 0) or 0)
-    if futures_avail >= required_usd:
-        return True
-    shortfall = required_usd - futures_avail
-    spot_avail = float(balances.get("spot", 0) or 0)
-
-    # Step 1: earn → spot (Bitget only, only when spot is insufficient)
-    if spot_avail < shortfall and venue_id == "bitget":
-        earn_shortfall = shortfall - spot_avail
-        earn_redeemed = _redeem_bitget_earn(quote, earn_shortfall, logs)
-        if earn_redeemed > 0:
-            import time as _t
-
-            _t.sleep(1.0)
-            spot_avail += earn_redeemed
-
-    # Step 2: spot → futures
-    if spot_avail >= shortfall:
-        try:
-            if venue.transfer_asset(quote, shortfall, "spot", "futures"):
-                logs.append(f"{venue_id}: spot->futures transfer {shortfall:.2f} {quote}")
-                return True
-        except Exception as e:
-            logs.append(f"{venue_id}: transfer failed ({e})")
-    logs.append(
-        f"{venue_id}: insufficient margin futures={futures_avail:.2f} "
-        f"spot={spot_avail:.2f} need {required_usd:.2f}"
-    )
-    return False
+        futures_avail = float(balances.get("futures", 0) or 0)
+    except Exception as exc:
+        logs.append(f"{venue_id}: futures balance query failed; refusing open ({exc})")
+        return False
+    if futures_avail < required_usd:
+        logs.append(
+            f"{venue_id}: insufficient pre-funded futures margin "
+            f"available={futures_avail:.2f} need={required_usd:.2f} {quote}"
+        )
+        return False
+    return True
 
 
 _EARN_PRODUCTS = {"USDT": "964334561256718336"}
@@ -198,45 +193,9 @@ _MIN_REDEEM_USDT = 1.0
 
 
 def _redeem_bitget_earn(coin: str, amount: float, logs: list[str]) -> float:
-    """Redeem from Bitget flexible earn. Returns redeemed amount on success, 0 on failure."""
-    pid = _EARN_PRODUCTS.get(coin)
-    if not pid:
-        return 0.0
-    if amount < _MIN_REDEEM_USDT:
-        return 0.0
-    try:
-        from venues.bitget import _api_call as _bitget_api
-
-        # Query earn balance
-        data = _bitget_api("GET", "/api/v2/earn/account/assets")
-        earn_bal = 0.0
-        for a in data.get("data", []):
-            if a.get("coin") == coin:
-                earn_bal = float(a.get("amount", "0"))
-                break
-        if earn_bal < _MIN_REDEEM_USDT:
-            logs.append(f"bitget earn: {coin} earn balance {earn_bal:.2f}, no need to redeem")
-            return 0.0
-        redeem_amt = min(amount, earn_bal)
-        # Redeem
-        result = _bitget_api(
-            "POST",
-            "/api/v2/earn/savings/redeem",
-            body={
-                "productId": pid,
-                "periodType": "flexible",
-                "amount": f"{redeem_amt:.2f}",
-            },
-        )
-        if result.get("code") == "00000":
-            logs.append(f"bitget earn: redeemed {redeem_amt:.2f} {coin} to spot")
-            return redeem_amt
-        else:
-            logs.append(f"bitget earn: redeem failed {result.get('msg', '')}")
-            return 0.0
-    except Exception as e:
-        logs.append(f"bitget earn: redeem exception ({e})")
-        return 0.0
+    """Disabled in safe execution; no automatic earn redemption is permitted."""
+    logs.append(f"automatic earn redemption disabled for {coin}")
+    return 0.0
 
 
 def _make_futures_trade(
@@ -273,8 +232,31 @@ def open_pure_futures_pair(
     capital_buffer_pct: additional margin reservation recommended by settle-mismatch planner
     (% of notional), factored into pre-open balance check.
     """
+    require_dry_run(dry_run, "pure-futures open")
     logs: list[str] = []
     executed: list[dict[str, Any]] = []
+    journal = SafeExecutionJournal(positions_path)
+    if not dry_run and journal.has_unresolved_work():
+        return CrossVenueResult(
+            False,
+            "recovery_required",
+            logs=journal.blocking_reasons() + ["new opens are blocked until recovery is reconciled"],
+        )
+    if not dry_run:
+        try:
+            load_pure_futures_positions(positions_path)
+        except (OSError, ValueError) as exc:
+            ledger_incident = f"ledger-{uuid.uuid4().hex}"
+            journal.record_incident(
+                ledger_incident,
+                "position_ledger_unreadable",
+                {"path": str(positions_path), "error": redact_secret_values(exc)},
+            )
+            return CrossVenueResult(
+                False,
+                "recovery_required",
+                logs=[f"position ledger unreadable; refusing live open: {exc}"],
+            )
     lv = _venue(long_venue_id, long_venue)
     sv = _venue(short_venue_id, short_venue)
 
@@ -387,11 +369,22 @@ def open_pure_futures_pair(
     if not (ok_long and ok_short):
         # Abort before first order to avoid single-leg fill and rollback
         return CrossVenueResult(False, "aborted", "", executed, logs)
-    for venue, mkt in ((lv, long_mkt), (sv, short_mkt)):
-        try:
+    try:
+        for venue, mkt in ((lv, long_mkt), (sv, short_mkt)):
             venue.initialize_futures_symbol(mkt["pair"])
-        except Exception:
-            pass
+    except Exception as exc:
+        return CrossVenueResult(
+            False, "aborted", "", executed, [f"futures symbol initialization failed: {exc}"]
+        )
+
+    journal.begin_operation(
+        position_id,
+        "pure_futures_open",
+        position_id=position_id,
+        base=base,
+        long_venue=long_venue_id,
+        short_venue=short_venue_id,
+    )
 
     parallel_legs = bool((config or {}).get("parallelLegs", True))
 
@@ -403,11 +396,15 @@ def open_pure_futures_pair(
         short_trade["amount_usdt"] = round(target_qty * short_px, 4)
 
         def _submit_long() -> tuple[str, list[dict[str, Any]]]:
-            return "long", lv.execute_trades([long_trade], long_market, dry_run=False)
+            return "long", execute_journaled_trade(
+                lv, long_trade, long_market, journal=journal,
+                operation_id=position_id, leg="long", venue_id=long_venue_id
+            )
 
         def _submit_short() -> tuple[str, list[dict[str, Any]]]:
-            return "short", sv.execute_trades(
-                [short_trade], short_market, dry_run=False
+            return "short", execute_journaled_trade(
+                sv, short_trade, short_market, journal=journal,
+                operation_id=position_id, leg="short", venue_id=short_venue_id
             )
 
         leg_results: dict[str, list[dict[str, Any]]] = {}
@@ -429,9 +426,64 @@ def open_pure_futures_pair(
         long_ok = _filled(res_long)
         short_ok = _filled(res_short)
 
+        statuses = {
+            str(rows[0].get("status", "unknown")) if rows else "unknown"
+            for rows in (res_long, res_short)
+        }
+        if statuses & {"partial", "unknown"}:
+            long_qty = _exec_qty(res_long, 0.0)
+            short_qty = _exec_qty(res_short, 0.0)
+            journal.record_incident(
+                position_id,
+                "parallel_leg_requires_recovery",
+                {"long_qty": long_qty, "short_qty": short_qty, "statuses": sorted(statuses)},
+            )
+            _persist_recovery_position(
+                position_id,
+                positions_path,
+                {
+                    "strategy": "pure_futures_spread",
+                    "base": base,
+                    "direction": direction,
+                    "quote": quote,
+                    "long_venue": long_venue_id,
+                    "short_venue": short_venue_id,
+                    "long_qty": long_qty,
+                    "short_qty": short_qty,
+                    "qty": min(long_qty, short_qty),
+                    "executed": executed,
+                    "reason": "parallel order status unresolved/partial",
+                },
+            )
+            return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
+
         if long_ok and short_ok:
-            exec_qty = _floor_qty(_exec_qty(res_long, target_qty), qty_prec)
-            short_qty = _exec_qty(res_short, target_qty)
+            exec_qty = _floor_qty(_exec_qty(res_long, 0.0), qty_prec)
+            short_qty = _exec_qty(res_short, 0.0)
+            if abs(exec_qty - short_qty) > max(1e-12, target_qty * 1e-8):
+                journal.record_incident(
+                    position_id,
+                    "paired_fill_quantity_mismatch",
+                    {"long_qty": exec_qty, "short_qty": short_qty},
+                )
+                _persist_recovery_position(
+                    position_id,
+                    positions_path,
+                    {
+                        "strategy": "pure_futures_spread",
+                        "base": base,
+                        "direction": direction,
+                        "quote": quote,
+                        "long_venue": long_venue_id,
+                        "short_venue": short_venue_id,
+                        "long_qty": exec_qty,
+                        "short_qty": short_qty,
+                        "qty": min(exec_qty, short_qty),
+                        "executed": executed,
+                        "reason": "confirmed leg quantities differ",
+                    },
+                )
+                return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
             logs.append(f"Parallel both legs filled: long={exec_qty} short={short_qty} {base}")
             _record_position(
                 {
@@ -456,107 +508,180 @@ def open_pure_futures_pair(
                 },
                 positions_path,
             )
+            journal.finish_operation(position_id, "filled")
             return CrossVenueResult(True, "filled", position_id, executed, logs)
         elif long_ok and not short_ok:
+            long_qty = _exec_qty(res_long, 0.0)
             logs.append("Parallel mode: long filled but short failed, rolling back long")
             rollback = _make_futures_trade(
                 base,
                 "close_long",
-                target_qty,
+                long_qty,
                 long_px,
                 qty_prec,
                 "ROLLBACK: parallel-legs short failed",
             )
-            res_rb = lv.execute_trades([rollback], long_market, dry_run=False)
+            res_rb = execute_journaled_trade(
+                lv, rollback, long_market, journal=journal,
+                operation_id=position_id, leg="long-rollback", venue_id=long_venue_id
+            )
             executed.extend(res_rb)
-            if _filled(res_rb):
+            if _filled(res_rb) and abs(_exec_qty(res_rb, 0.0) - long_qty) <= max(1e-12, long_qty * 1e-8):
                 logs.append("Rollback succeeded, no naked position")
+                journal.finish_operation(position_id, "rolled_back")
                 return CrossVenueResult(False, "rolled_back", "", executed, logs)
-            logs.append("Rollback failed! Long leg naked, requires manual handling")
+            journal.record_incident(
+                position_id,
+                "parallel_long_rollback_not_confirmed",
+                {"long_qty": long_qty, "rollback_result": res_rb[0] if res_rb else None},
+            )
+            _persist_recovery_position(
+                position_id,
+                positions_path,
+                {
+                    "strategy": "pure_futures_spread", "base": base, "direction": direction,
+                    "quote": quote, "long_venue": long_venue_id, "short_venue": short_venue_id,
+                    "long_qty": long_qty, "short_qty": 0.0, "qty": long_qty,
+                    "executed": executed, "reason": "parallel long rollback not confirmed",
+                },
+            )
+            logs.append("Rollback failed! Long leg requires manual recovery")
             send_notification(
                 "NAKED PURE FUTURES POSITION",
-                f"Pure-futures parallel rollback failed: {long_venue_id} long {target_qty} {base} unhedged",
+                f"Pure-futures parallel rollback failed: {long_venue_id} long {long_qty} {base} unhedged",
                 config,
             )
-            return CrossVenueResult(False, "naked", "", executed, logs)
+            return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
         elif short_ok and not long_ok:
+            short_qty = _exec_qty(res_short, 0.0)
             logs.append("Parallel mode: short filled but long failed, rolling back short")
             rollback = _make_futures_trade(
                 base,
                 "close_short",
-                target_qty,
+                short_qty,
                 short_px,
                 qty_prec,
                 "ROLLBACK: parallel-legs long failed",
             )
-            res_rb = sv.execute_trades([rollback], short_market, dry_run=False)
+            res_rb = execute_journaled_trade(
+                sv, rollback, short_market, journal=journal,
+                operation_id=position_id, leg="short-rollback", venue_id=short_venue_id
+            )
             executed.extend(res_rb)
-            if _filled(res_rb):
+            if _filled(res_rb) and abs(_exec_qty(res_rb, 0.0) - short_qty) <= max(1e-12, short_qty * 1e-8):
                 logs.append("Rollback succeeded, no naked position")
+                journal.finish_operation(position_id, "rolled_back")
                 return CrossVenueResult(False, "rolled_back", "", executed, logs)
-            logs.append("Rollback failed! Short leg naked, requires manual handling")
+            journal.record_incident(
+                position_id,
+                "parallel_short_rollback_not_confirmed",
+                {"short_qty": short_qty, "rollback_result": res_rb[0] if res_rb else None},
+            )
+            _persist_recovery_position(
+                position_id,
+                positions_path,
+                {
+                    "strategy": "pure_futures_spread", "base": base, "direction": direction,
+                    "quote": quote, "long_venue": long_venue_id, "short_venue": short_venue_id,
+                    "long_qty": 0.0, "short_qty": short_qty, "qty": short_qty,
+                    "executed": executed, "reason": "parallel short rollback not confirmed",
+                },
+            )
+            logs.append("Rollback failed! Short leg requires manual recovery")
             send_notification(
                 "NAKED PURE FUTURES POSITION",
-                f"Pure-futures parallel rollback failed: {short_venue_id} short {target_qty} {base} unhedged",
+                f"Pure-futures parallel rollback failed: {short_venue_id} short {short_qty} {base} unhedged",
                 config,
             )
-            return CrossVenueResult(False, "naked", "", executed, logs)
+            return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
         else:
-            logs.append("Parallel mode: both legs unfilled")
+            logs.append("Parallel mode: both legs confirmed no-fill")
+            journal.finish_operation(position_id, "aborted_no_fill")
             return CrossVenueResult(False, "aborted", "", executed, logs)
 
-    # === Original sequential logic follows ===
-    res_long = lv.execute_trades([long_trade], long_market, dry_run=False)
+    # Sequential mode is journaled identically, but submits one confirmed leg at a time.
+    res_long = execute_journaled_trade(
+        lv, long_trade, long_market, journal=journal,
+        operation_id=position_id, leg="long", venue_id=long_venue_id
+    )
     executed.extend(res_long)
     if not _filled(res_long):
-        logs.append(
-            f"Long leg failed: {res_long[0].get('error') if res_long else 'no result'}"
+        if res_long and res_long[0].get("status") == "failed":
+            journal.finish_operation(position_id, "aborted_no_fill")
+            return CrossVenueResult(
+                False, "aborted", "", executed,
+                [f"Long leg failed: {res_long[0].get('error', 'confirmed no fill')}"],
+            )
+        long_qty = _exec_qty(res_long, 0.0)
+        _persist_recovery_position(
+            position_id,
+            positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base, "direction": direction,
+                "quote": quote, "long_venue": long_venue_id, "short_venue": short_venue_id,
+                "long_qty": long_qty, "short_qty": 0.0, "qty": long_qty,
+                "executed": executed, "reason": "sequential long order state unresolved/partial",
+            },
         )
-        return CrossVenueResult(False, "aborted", "", executed, logs)
-    exec_qty = _floor_qty(_exec_qty(res_long, base_amount), qty_prec)
+        return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
+    exec_qty = _exec_qty(res_long, 0.0)
     logs.append(f"Long leg filled {long_venue_id} open_long {exec_qty} {base}")
 
-    short_trade["amount_base"] = exec_qty
-    short_trade["amount_usdt"] = round(exec_qty * short_px, 4)
-    res_short = sv.execute_trades([short_trade], short_market, dry_run=False)
+    short_trade["amount_base"] = _floor_qty(exec_qty, qty_prec)
+    short_trade["amount_usdt"] = round(short_trade["amount_base"] * short_px, 4)
+    res_short = execute_journaled_trade(
+        sv, short_trade, short_market, journal=journal,
+        operation_id=position_id, leg="short", venue_id=short_venue_id
+    )
     executed.extend(res_short)
     if _filled(res_short):
-        short_qty = _exec_qty(res_short, exec_qty)
-        logs.append(f"Short leg filled {short_venue_id} open_short {short_qty} {base}")
+        short_qty = _exec_qty(res_short, 0.0)
+        if abs(exec_qty - short_qty) > max(1e-12, exec_qty * 1e-8):
+            journal.record_incident(
+                position_id, "paired_fill_quantity_mismatch",
+                {"long_qty": exec_qty, "short_qty": short_qty},
+            )
+            _persist_recovery_position(
+                position_id, positions_path,
+                {
+                    "strategy": "pure_futures_spread", "base": base, "direction": direction,
+                    "quote": quote, "long_venue": long_venue_id, "short_venue": short_venue_id,
+                    "long_qty": exec_qty, "short_qty": short_qty, "qty": min(exec_qty, short_qty),
+                    "executed": executed, "reason": "confirmed leg quantities differ",
+                },
+            )
+            return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
         _record_position(
             {
-                "id": position_id,
-                "status": "open",
-                "strategy": "pure_futures_spread",
-                "dry_run": False,
-                "base": base,
-                "direction": direction,
-                "quote": quote,
-                "long_venue": long_venue_id,
-                "short_venue": short_venue_id,
-                "qty": min(exec_qty, short_qty),
-                "long_qty": exec_qty,
-                "short_qty": short_qty,
+                "id": position_id, "status": "open", "strategy": "pure_futures_spread",
+                "dry_run": False, "base": base, "direction": direction, "quote": quote,
+                "long_venue": long_venue_id, "short_venue": short_venue_id,
+                "qty": exec_qty, "long_qty": exec_qty, "short_qty": short_qty,
                 "long_price": res_long[0].get("exec_price", long_px),
                 "short_price": res_short[0].get("exec_price", short_px),
-                "trade_usd": trade_usd,
-                "mark_spread_pct": round(mark_spread_pct, 6),
+                "trade_usd": trade_usd, "mark_spread_pct": round(mark_spread_pct, 6),
                 "opened_at": int(time.time() * 1000),
             },
             positions_path,
         )
+        journal.finish_operation(position_id, "filled")
         return CrossVenueResult(True, "filled", position_id, executed, logs)
 
-    # Short leg failed → close long leg.
-    logs.append(
-        f"Short leg failed: {res_short[0].get('error') if res_short else 'no result'}, rolling back long leg"
-    )
+    short_status = str(res_short[0].get("status", "unknown")) if res_short else "unknown"
+    if short_status in {"partial", "unknown"}:
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base, "direction": direction,
+                "quote": quote, "long_venue": long_venue_id, "short_venue": short_venue_id,
+                "long_qty": exec_qty, "short_qty": _exec_qty(res_short, 0.0), "qty": exec_qty,
+                "executed": executed, "reason": f"sequential short order state is {short_status}",
+            },
+        )
+        return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
+
     rollback = _make_futures_trade(
-        base,
-        "close_long",
-        exec_qty,
-        long_px,
-        qty_prec,
+        base, "close_long", exec_qty, long_px, qty_prec,
         "ROLLBACK: pure-futures short leg failed",
     )
     send_notification(
@@ -564,19 +689,34 @@ def open_pure_futures_pair(
         f"{short_venue_id} open_short {base} failed; rolling back {long_venue_id} close_long {exec_qty}",
         config,
     )
-    res_rb = lv.execute_trades([rollback], long_market, dry_run=False)
+    res_rb = execute_journaled_trade(
+        lv, rollback, long_market, journal=journal,
+        operation_id=position_id, leg="long-rollback", venue_id=long_venue_id
+    )
     executed.extend(res_rb)
-    if _filled(res_rb):
-        logs.append("Rollback succeeded, no naked position")
+    if _filled(res_rb) and abs(_exec_qty(res_rb, 0.0) - exec_qty) <= max(1e-12, exec_qty * 1e-8):
+        journal.finish_operation(position_id, "rolled_back")
         return CrossVenueResult(False, "rolled_back", "", executed, logs)
-
-    logs.append("Rollback failed! Long leg naked, requires manual handling")
+    journal.record_incident(
+        position_id, "sequential_long_rollback_not_confirmed",
+        {"long_qty": exec_qty, "rollback_result": res_rb[0] if res_rb else None},
+    )
+    _persist_recovery_position(
+        position_id, positions_path,
+        {
+            "strategy": "pure_futures_spread", "base": base, "direction": direction,
+            "quote": quote, "long_venue": long_venue_id, "short_venue": short_venue_id,
+            "long_qty": exec_qty, "short_qty": 0.0, "qty": exec_qty,
+            "executed": executed, "reason": "sequential long rollback not confirmed",
+        },
+    )
+    logs.append("Rollback failed! Long leg requires manual recovery")
     send_notification(
         "NAKED PURE FUTURES POSITION",
         f"Pure-futures rollback failed: {long_venue_id} long {exec_qty} {base} unhedged",
         config,
     )
-    return CrossVenueResult(False, "naked", "", executed, logs)
+    return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
 
 
 def close_pure_futures_pair(
@@ -601,6 +741,7 @@ def close_pure_futures_pair(
     short_id = str(pos["short_venue"])
     if dry_run is None:
         dry_run = bool(pos.get("dry_run", True))
+    require_dry_run(dry_run, "pure-futures close")
 
     lv = _venue(long_id, long_venue)
     sv = _venue(short_id, short_venue)
@@ -658,24 +799,86 @@ def close_pure_futures_pair(
         logs.append(f"[DRY-RUN] close pure-futures {base} qty={qty}")
         return CrossVenueResult(True, "simulated", position_id, executed, logs)
 
-    res_short = sv.execute_trades([short_close], short_market, dry_run=False)
+    journal = SafeExecutionJournal(positions_path)
+    if journal.has_unresolved_work():
+        return CrossVenueResult(
+            False, "recovery_required", position_id,
+            logs=journal.blocking_reasons() + ["close blocked until existing recovery is reconciled"],
+        )
+    try:
+        for venue, market_snapshot in ((sv, short_mkt), (lv, long_mkt)):
+            venue.initialize_futures_symbol(market_snapshot["pair"])
+    except Exception as exc:
+        return CrossVenueResult(
+            False, "aborted", position_id, logs=[f"futures symbol initialization failed: {exc}"]
+        )
+
+    operation_id = f"{position_id}-close-{uuid.uuid4().hex}"
+    journal.begin_operation(operation_id, "pure_futures_close", position_id=position_id)
+    res_short = execute_journaled_trade(
+        sv, short_close, short_market, journal=journal,
+        operation_id=operation_id, leg="short-close", venue_id=short_id,
+    )
     executed.extend(res_short)
     if not _filled(res_short):
-        logs.append(
-            f"Short close failed: {res_short[0].get('error') if res_short else 'no result'}"
+        status = str(res_short[0].get("status", "unknown")) if res_short else "unknown"
+        logs.append(f"Short close state {status}: {res_short[0].get('error') if res_short else 'no result'}")
+        if status == "failed":
+            journal.finish_operation(operation_id, "close_rejected")
+            return CrossVenueResult(False, "aborted", position_id, executed, logs)
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base, "direction": pos.get("direction"),
+                "quote": quote, "long_venue": long_id, "short_venue": short_id,
+                "long_qty": float(pos.get("long_qty", qty)), "short_qty": float(pos.get("short_qty", qty)),
+                "qty": qty, "executed": executed, "reason": f"short close state is {status}",
+            },
         )
-        return CrossVenueResult(False, "aborted", position_id, executed, logs)
-    closed_short_qty = _exec_qty(res_short, qty)
+        return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
+
+    closed_short_qty = _exec_qty(res_short, 0.0)
+    if abs(closed_short_qty - qty) > max(1e-12, qty * 1e-8):
+        journal.record_incident(
+            operation_id, "pure_futures_partial_short_close",
+            {"requested_qty": qty, "closed_qty": closed_short_qty},
+        )
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base, "direction": pos.get("direction"),
+                "quote": quote, "long_venue": long_id, "short_venue": short_id,
+                "long_qty": float(pos.get("long_qty", qty)), "short_qty": max(0.0, qty-closed_short_qty),
+                "qty": qty, "executed": executed, "reason": "short close quantity differs from requested",
+            },
+        )
+        return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
     logs.append(f"Short leg closed {short_id} close_short {closed_short_qty} {base}")
 
     long_close["amount_base"] = _floor_qty(closed_short_qty, qty_prec)
-    res_long = lv.execute_trades([long_close], long_market, dry_run=False)
+    res_long = execute_journaled_trade(
+        lv, long_close, long_market, journal=journal,
+        operation_id=operation_id, leg="long-close", venue_id=long_id,
+    )
     executed.extend(res_long)
     if _filled(res_long):
-        logs.append(
-            f"Long leg closed {long_id} close_long {long_close['amount_base']} {base}"
-        )
-        _mark_closed(
+        closed_long_qty = _exec_qty(res_long, 0.0)
+        if abs(closed_long_qty - closed_short_qty) > max(1e-12, closed_short_qty * 1e-8):
+            journal.record_incident(
+                operation_id, "paired_close_quantity_mismatch",
+                {"short_closed_qty": closed_short_qty, "long_closed_qty": closed_long_qty},
+            )
+            _persist_recovery_position(
+                position_id, positions_path,
+                {
+                    "strategy": "pure_futures_spread", "base": base, "direction": pos.get("direction"),
+                    "quote": quote, "long_venue": long_id, "short_venue": short_id,
+                    "long_qty": max(0.0, qty-closed_long_qty), "short_qty": max(0.0, qty-closed_short_qty),
+                    "qty": qty, "executed": executed, "reason": "confirmed close quantities differ",
+                },
+            )
+            return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
+        marked = _mark_closed(
             position_id,
             {
                 "short_price": res_short[0].get("exec_price"),
@@ -685,16 +888,41 @@ def close_pure_futures_pair(
             },
             positions_path,
         )
+        if not marked:
+            journal.record_incident(
+                operation_id, "closed_pair_ledger_update_failed", {"position_id": position_id}
+            )
+            _persist_recovery_position(
+                position_id, positions_path,
+                {
+                    "strategy": "pure_futures_spread", "base": base, "direction": pos.get("direction"),
+                    "quote": quote, "long_venue": long_id, "short_venue": short_id,
+                    "long_qty": 0.0, "short_qty": 0.0, "qty": qty,
+                    "executed": executed, "reason": "both closes filled but ledger update failed",
+                },
+            )
+            return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
+        journal.finish_operation(operation_id, "closed")
+        logs.append(f"Both legs closed {base} qty={closed_long_qty}")
         return CrossVenueResult(True, "filled", position_id, executed, logs)
 
-    # Long close failed → re-open short to restore hedge.
-    logs.append("Long close failed; re-opening short to restore hedge")
+    long_status = str(res_long[0].get("status", "unknown")) if res_long else "unknown"
+    if long_status in {"partial", "unknown"}:
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base, "direction": pos.get("direction"),
+                "quote": quote, "long_venue": long_id, "short_venue": short_id,
+                "long_qty": max(0.0, qty-_exec_qty(res_long, 0.0)),
+                "short_qty": max(0.0, qty-closed_short_qty), "qty": qty,
+                "executed": executed, "reason": f"long close state is {long_status}",
+            },
+        )
+        return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
+
+    # Long close was confirmed no-fill; reopen the short quantity already closed.
     reopen = _make_futures_trade(
-        base,
-        "open_short",
-        closed_short_qty,
-        short_px,
-        qty_prec,
+        base, "open_short", closed_short_qty, short_px, qty_prec,
         "ROLLBACK: pure-futures long close failed",
     )
     send_notification(
@@ -702,19 +930,36 @@ def close_pure_futures_pair(
         f"{long_id} close_long {base} failed; re-opening {short_id} open_short {closed_short_qty}",
         config,
     )
-    res_rb = sv.execute_trades([reopen], short_market, dry_run=False)
+    res_rb = execute_journaled_trade(
+        sv, reopen, short_market, journal=journal,
+        operation_id=operation_id, leg="short-reopen-rollback", venue_id=short_id,
+    )
     executed.extend(res_rb)
-    if _filled(res_rb):
+    if _filled(res_rb) and abs(_exec_qty(res_rb, 0.0) - closed_short_qty) <= max(1e-12, closed_short_qty * 1e-8):
+        journal.finish_operation(operation_id, "rolled_back")
         logs.append("Re-hedged; position remains open")
         return CrossVenueResult(False, "rolled_back", position_id, executed, logs)
 
-    logs.append("Re-hedge failed! Long leg is naked and requires manual handling")
+    journal.record_incident(
+        operation_id, "short_reopen_not_confirmed",
+        {"short_qty": closed_short_qty, "rollback_result": res_rb[0] if res_rb else None},
+    )
+    _persist_recovery_position(
+        position_id, positions_path,
+        {
+            "strategy": "pure_futures_spread", "base": base, "direction": pos.get("direction"),
+            "quote": quote, "long_venue": long_id, "short_venue": short_id,
+            "long_qty": qty, "short_qty": max(0.0, qty-closed_short_qty), "qty": qty,
+            "executed": executed, "reason": "short reopen not confirmed after long close rejection",
+        },
+    )
+    logs.append("Re-hedge failed! Position requires manual recovery")
     send_notification(
         "NAKED PURE FUTURES POSITION",
-        f"Pure-futures close rollback failed: {long_id} long {base} exposure unhedged",
+        f"Pure-futures close rollback failed: {long_id} long {base} exposure requires reconciliation",
         config,
     )
-    return CrossVenueResult(False, "naked", position_id, executed, logs)
+    return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
 
 
 def close_pure_futures_leg(
@@ -733,6 +978,7 @@ def close_pure_futures_leg(
     Placing a close order on a disappeared leg opens a new opposite position, so when both-leg
     state is abnormal, only submit orders for the leg that is still alive. leg ∈ {"long", "short"}.
     """
+    block_real_execution("single-leg order close")
     if leg not in ("long", "short"):
         return CrossVenueResult(False, "aborted", logs=[f"invalid leg={leg!r}"])
     pos = _get_open_position(position_id, positions_path)
@@ -754,22 +1000,68 @@ def close_pure_futures_leg(
     trade = _make_futures_trade(
         base, f"close_{leg}", qty, px, qprec, f"{close_reason} {position_id}"
     )
-    res = v.execute_trades([trade], {base: mkt}, dry_run=False)
+    journal = SafeExecutionJournal(positions_path)
+    if journal.has_unresolved_work():
+        return CrossVenueResult(
+            False, "recovery_required", position_id,
+            logs=journal.blocking_reasons() + ["single-leg close blocked until recovery is reconciled"],
+        )
+    try:
+        v.initialize_futures_symbol(mkt["pair"])
+    except Exception as exc:
+        return CrossVenueResult(
+            False, "aborted", position_id,
+            logs=[f"futures symbol initialization failed: {exc}"],
+        )
+
+    operation_id = f"{position_id}-single-close-{leg}-{uuid.uuid4().hex}"
+    journal.begin_operation(operation_id, "pure_futures_single_leg_close", position_id=position_id, leg=leg)
+    res = execute_journaled_trade(
+        v, trade, {base: mkt}, journal=journal, operation_id=operation_id,
+        leg=f"{leg}-close", venue_id=venue_id,
+    )
     logs: list[str] = []
     if not _filled(res):
-        logs.append(
-            f"{venue_id} close_{leg} failed: "
-            f"{res[0].get('error') if res else 'no result'}"
+        status = str(res[0].get("status", "unknown")) if res else "unknown"
+        logs.append(f"{venue_id} close_{leg} state {status}: {res[0].get('error') if res else 'no result'}")
+        if status == "failed":
+            journal.finish_operation(operation_id, "close_rejected")
+            return CrossVenueResult(False, "aborted", position_id, res, logs)
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base,
+                "long_venue": pos.get("long_venue"), "short_venue": pos.get("short_venue"),
+                "qty": float(pos.get("qty", qty)), "executed": res,
+                "reason": f"single-leg {leg} close state is {status}",
+            },
         )
         send_notification(
-            "Single Leg Close Failed",
-            f"Position {position_id} {base}: close_{leg}@{venue_id} failed, "
-            f"exposure remains unhedged",
+            "Single Leg Close Requires Recovery",
+            f"Position {position_id} {base}: {venue_id} close_{leg} has unresolved state",
             config,
         )
-        return CrossVenueResult(False, "naked", position_id, res, logs)
-    logs.append(f"{venue_id} close_{leg} {qty} {base} closed (other leg disappeared)")
-    _mark_closed(
+        return CrossVenueResult(False, "recovery_required", position_id, res, logs)
+
+    closed_qty = _exec_qty(res, 0.0)
+    if abs(closed_qty - qty) > max(1e-12, qty * 1e-8):
+        journal.record_incident(
+            operation_id, "single_leg_close_quantity_mismatch",
+            {"requested_qty": qty, "closed_qty": closed_qty},
+        )
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base,
+                "long_venue": pos.get("long_venue"), "short_venue": pos.get("short_venue"),
+                "qty": float(pos.get("qty", qty)), "executed": res,
+                "reason": "single-leg close quantity differs from requested",
+            },
+        )
+        return CrossVenueResult(False, "recovery_required", position_id, res, logs)
+
+    logs.append(f"{venue_id} close_{leg} {closed_qty} {base} closed (other leg disappeared)")
+    marked = _mark_closed(
         position_id,
         {
             "single_leg": leg,
@@ -778,6 +1070,21 @@ def close_pure_futures_leg(
         },
         positions_path,
     )
+    if not marked:
+        journal.record_incident(
+            operation_id, "single_leg_close_ledger_update_failed", {"position_id": position_id}
+        )
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base,
+                "long_venue": pos.get("long_venue"), "short_venue": pos.get("short_venue"),
+                "qty": float(pos.get("qty", qty)), "executed": res,
+                "reason": "single-leg close filled but ledger update failed",
+            },
+        )
+        return CrossVenueResult(False, "recovery_required", position_id, res, logs)
+    journal.finish_operation(operation_id, "closed_single_leg")
     return CrossVenueResult(True, "filled", position_id, res, logs)
 
 
@@ -828,6 +1135,7 @@ def rebalance_pure_futures_pair(
     short_id = str(pos["short_venue"])
     if dry_run is None:
         dry_run = bool(pos.get("dry_run", True))
+    require_dry_run(dry_run, "pure-futures rebalance")
 
     lv = _venue(long_id, long_venue)
     sv = _venue(short_id, short_venue)
@@ -892,22 +1200,69 @@ def rebalance_pure_futures_pair(
         logs.append(f"[DRY-RUN] rebalance {trim_id} {trade_type} {trim_qty} {base}")
         return CrossVenueResult(True, "simulated", position_id, executed, logs)
 
-    res = trim_venue.execute_trades([trade], market, dry_run=False)
+    journal = SafeExecutionJournal(positions_path)
+    if journal.has_unresolved_work():
+        return CrossVenueResult(
+            False, "recovery_required", position_id, executed,
+            journal.blocking_reasons() + ["rebalance blocked until recovery is reconciled"],
+        )
+    try:
+        trim_venue.initialize_futures_symbol(trim_mkt["pair"])
+    except Exception as exc:
+        return CrossVenueResult(
+            False, "aborted", position_id, executed,
+            logs + [f"futures symbol initialization failed: {exc}"],
+        )
+    operation_id = f"{position_id}-rebalance-{uuid.uuid4().hex}"
+    journal.begin_operation(operation_id, "pure_futures_rebalance", position_id=position_id)
+    res = execute_journaled_trade(
+        trim_venue, trade, market, journal=journal, operation_id=operation_id,
+        leg=f"{trade_type}-trim", venue_id=trim_id,
+    )
     executed.extend(res)
     if not _filled(res):
-        logs.append(f"Rebalance failed: {res[0].get('error') if res else 'no result'}")
+        status = str(res[0].get("status", "unknown")) if res else "unknown"
+        logs.append(f"Rebalance state {status}: {res[0].get('error') if res else 'no result'}")
         send_notification(
-            "Pure Futures Rebalance Failed",
-            f"Position {position_id} {base}: {trim_id} {trade_type} {trim_qty} failed; "
+            "Pure Futures Rebalance Requires Recovery",
+            f"Position {position_id} {base}: {trim_id} {trade_type} {trim_qty} has state {status}; "
             f"legs remain skewed (long={lq} short={sq})",
             config,
         )
-        return CrossVenueResult(False, "aborted", position_id, executed, logs)
+        if status == "failed":
+            journal.finish_operation(operation_id, "aborted_no_fill")
+            return CrossVenueResult(False, "aborted", position_id, executed, logs)
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base,
+                "long_venue": long_id, "short_venue": short_id,
+                "long_qty": lq, "short_qty": sq, "qty": min(lq, sq),
+                "executed": executed, "reason": f"rebalance order state is {status}",
+            },
+        )
+        return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
 
-    trimmed = _exec_qty(res, trim_qty)
+    trimmed = _exec_qty(res, 0.0)
+    if abs(trimmed - trim_qty) > max(1e-12, trim_qty * 1e-8):
+        journal.record_incident(
+            operation_id, "rebalance_quantity_mismatch",
+            {"requested_qty": trim_qty, "trimmed_qty": trimmed},
+        )
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base,
+                "long_venue": long_id, "short_venue": short_id,
+                "long_qty": lq, "short_qty": sq, "qty": min(lq, sq),
+                "executed": executed, "reason": "confirmed rebalance quantity differs",
+            },
+        )
+        return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
+
     new_qty = _floor_qty(min(lq, sq), qty_prec)
     logs.append(f"Rebalance filled {trim_id} {trade_type} {trimmed} {base} → qty={new_qty}")
-    _update_position(
+    updated = _update_position(
         position_id,
         {
             "qty": new_qty,
@@ -923,4 +1278,19 @@ def rebalance_pure_futures_pair(
         },
         positions_path,
     )
+    if not updated:
+        journal.record_incident(
+            operation_id, "rebalance_ledger_update_failed", {"position_id": position_id}
+        )
+        _persist_recovery_position(
+            position_id, positions_path,
+            {
+                "strategy": "pure_futures_spread", "base": base,
+                "long_venue": long_id, "short_venue": short_id,
+                "long_qty": lq, "short_qty": sq, "qty": new_qty,
+                "executed": executed, "reason": "rebalance filled but ledger update failed",
+            },
+        )
+        return CrossVenueResult(False, "recovery_required", position_id, executed, logs)
+    journal.finish_operation(operation_id, "rebalanced")
     return CrossVenueResult(True, "filled", position_id, executed, logs)

@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
 
 router = APIRouter(tags=["backtest"])
 
@@ -46,7 +46,11 @@ def _ensure_results_dir() -> Path:
 
 
 class BacktestRequest(BaseModel):
-    jsonl_file: str | None = Field(None, description="Historical data JSONL file path")
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    jsonl_file: str | None = Field(
+        None, max_length=4096, description="JSONL filename within the server data directory"
+    )
     history_bases: str | None = Field(
         None, description="Backtest asset list, comma-separated, e.g. BTC,ETH"
     )
@@ -79,15 +83,58 @@ class BacktestRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-_DEFAULT_JSONL = (
-    Path(__file__).resolve().parent.parent.parent
-    / "data"
-    / "pure_futures_spreads.jsonl"
-)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_DATA_ROOT = _PROJECT_ROOT / "data"
+_DEFAULT_JSONL = _DATA_ROOT / "pure_futures_spreads.jsonl"
 
 
-def _load_snapshots_for_request(req: BacktestRequest) -> list[dict[str, Any]]:
-    """Load snapshots either from exchange funding history or a scanner JSONL file."""
+def _resolve_jsonl_path(
+    jsonl_file: str | None,
+    *,
+    data_root: Path | None = None,
+) -> Path:
+    """Resolve a JSONL name strictly inside the scanner data directory.
+
+    The API accepts a filename or a path prefixed by ``data/`` for compatibility
+    with the CLI. Absolute paths, parent traversal, non-JSONL files, and symlink
+    escapes are rejected before the backtest loader opens anything.
+    """
+    root_source = _DATA_ROOT if data_root is None else Path(data_root)
+    root = root_source.resolve(strict=False)
+    if data_root is None and not root.is_relative_to(_PROJECT_ROOT):
+        raise ValueError("server data directory must remain inside the project root")
+
+    raw_path = "pure_futures_spreads.jsonl" if jsonl_file is None else jsonl_file
+    if not raw_path or len(raw_path) > 4096 or "\\" in raw_path or "\x00" in raw_path:
+        raise ValueError("invalid JSONL filename")
+
+    requested = Path(raw_path)
+    if requested.is_absolute() or ".." in requested.parts:
+        raise ValueError("absolute paths and parent traversal are not allowed")
+    parts = list(requested.parts)
+    if parts and parts[0] == "data":
+        parts = parts[1:]
+    if not parts:
+        raise ValueError("a JSONL filename is required")
+
+    relative = Path(*parts)
+    if relative.suffix.lower() != ".jsonl":
+        raise ValueError("only .jsonl files are allowed")
+
+    resolved = (root / relative).resolve(strict=False)
+    if not resolved.is_relative_to(root):
+        raise ValueError("JSONL path escapes the server data directory")
+    if resolved.exists() and not resolved.is_file():
+        raise ValueError("JSONL path must refer to a regular file")
+    return resolved
+
+
+def _load_snapshots_for_request(
+    req: BacktestRequest,
+    *,
+    jsonl_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Load snapshots either from exchange funding history or the safe data directory."""
     if req.history_bases:
         from backtest.funding_history_source import (
             fetch_history_snapshots,  # noqa: E402
@@ -104,10 +151,7 @@ def _load_snapshots_for_request(req: BacktestRequest) -> list[dict[str, Any]]:
 
     from backtest.backtest_pure_futures_spread import load_snapshots  # noqa: E402
 
-    jsonl_path = Path(req.jsonl_file) if req.jsonl_file else _DEFAULT_JSONL
-    if not jsonl_path.is_absolute():
-        jsonl_path = Path(__file__).resolve().parent.parent.parent / jsonl_path
-    return load_snapshots(jsonl_path)
+    return load_snapshots(jsonl_path or _resolve_jsonl_path(req.jsonl_file))
 
 
 def _venues_from_pair_id(pair_id: str) -> tuple[str, str]:
@@ -173,13 +217,20 @@ async def run_backtest(req: BacktestRequest):
             "live": False,
         }
 
+    jsonl_path: Path | None = None
+    if req.jsonl_file is not None or not req.history_bases:
+        try:
+            jsonl_path = _resolve_jsonl_path(req.jsonl_file)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
     try:
         import asyncio
 
         loop = asyncio.get_running_loop()
 
         def _run() -> dict[str, Any]:
-            snapshots = _load_snapshots_for_request(req)
+            snapshots = _load_snapshots_for_request(req, jsonl_path=jsonl_path)
             if not snapshots:
                 raise RuntimeError(
                     "No snapshots available — provide history_bases (e.g. BTC,ETH) "

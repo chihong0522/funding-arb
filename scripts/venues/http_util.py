@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Any, Optional
 
@@ -11,10 +10,6 @@ import requests
 
 _DEFAULT_UA = "Mozilla/5.0 (compatible; funding-arb/1.0)"
 
-
-def credentials_file() -> str:
-    """Plaintext credentials JSON path used by venue adapters as an env fallback."""
-    return os.path.expanduser("~/.funding-arb/credentials.json")
 
 # Module-level session with connection pooling and keep-alive.
 # Thread-safe: requests.Session is safe for concurrent use across threads.

@@ -7,10 +7,13 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import venues.dydx as dydx_mod  # noqa: E402
+from core.execution_policy import LiveExecutionDisabled  # noqa: E402
 from venues.dydx import (  # noqa: E402
     DydxVenue,
     _base_from_pair,
@@ -136,37 +139,31 @@ class TestExecution:
         assert results[0]["status"] == "failed"
         assert "Unknown trade type" in results[0]["error"]
 
-    def test_live_without_optin_fails_with_guidance(self, monkeypatch):
+    def test_real_order_is_blocked_even_without_optin(self, monkeypatch):
         monkeypatch.delenv("DYDX_ENABLE_LIVE", raising=False)
         v = _fresh()
-        results = v.execute_trades(
-            [{"symbol": "BTCUSDT", "type": "open_long", "amount_base": 0.01}],
-            {"BTCUSDT": {"price": 64000.0}},
-            dry_run=False,
-        )
-        assert results[0]["status"] == "failed"
-        assert "DYDX_ENABLE_LIVE" in results[0]["error"]
+        with patch.object(dydx_mod, "_submit_market_order") as submit:
+            with pytest.raises(LiveExecutionDisabled):
+                v.execute_trades(
+                    [{"symbol": "BTCUSDT", "type": "open_long", "amount_base": 0.01}],
+                    {"BTCUSDT": {"price": 64000.0}},
+                    dry_run=False,
+                )
+        submit.assert_not_called()
 
-    def test_live_optin_without_creds_fails(self, monkeypatch):
+    def test_real_order_is_blocked_even_with_live_optin_and_credentials(self, monkeypatch):
         monkeypatch.setenv("DYDX_ENABLE_LIVE", "1")
-        monkeypatch.delenv("DYDX_MNEMONIC", raising=False)
-        monkeypatch.delenv("DYDX_ADDRESS", raising=False)
+        monkeypatch.setenv("DYDX_MNEMONIC", "synthetic test mnemonic")
+        monkeypatch.setenv("DYDX_ADDRESS", "dydx1synthetictest")
         v = _fresh()
-        # _ensure_wallet hits _ensure_sdk first; stub it out so the test
-        # doesn't require the real dydx-v4-client wheel.
-        with (
-            patch.object(dydx_mod, "_ensure_sdk"),
-            patch.object(dydx_mod, "_network_module", object()),
-            patch.object(dydx_mod, "_node_client_cls", object),
-            patch.object(dydx_mod, "_wallet_cls", object),
-        ):
-            results = v.execute_trades(
-                [{"symbol": "BTCUSDT", "type": "open_long", "amount_base": 0.01}],
-                {"BTCUSDT": {"price": 64000.0}},
-                dry_run=False,
-            )
-        assert results[0]["status"] == "failed"
-        assert "DYDX_MNEMONIC" in results[0]["error"]
+        with patch.object(dydx_mod, "_submit_market_order") as submit:
+            with pytest.raises(LiveExecutionDisabled):
+                v.execute_trades(
+                    [{"symbol": "BTCUSDT", "type": "open_long", "amount_base": 0.01}],
+                    {"BTCUSDT": {"price": 64000.0}},
+                    dry_run=False,
+                )
+        submit.assert_not_called()
 
 
 class TestFundingIndexMid:
@@ -266,8 +263,12 @@ class TestRegistration:
         assert v.venue_id == "dydx"
 
 
-class TestLiveExecution:
-    """Test the live order submission path with mocked SDK components."""
+class TestOrderAlgorithmWithFakeTransport:
+    """Test order mapping with an explicit module-local gate stub and fake submitter.
+
+    These unit tests do not enable or exercise live dYdX submission. The
+    unpatched production gate is asserted above and in the global safety suite.
+    """
 
     def test_side_mapping_open_long_is_buy(self, monkeypatch):
         """open_long and close_short should map to BUY side."""
@@ -279,8 +280,8 @@ class TestLiveExecution:
         assert _side_from_type("open_short") == "SELL"
         assert _side_from_type("close_long") == "SELL"
 
-    def test_live_order_success_path(self, monkeypatch):
-        """Full happy path: wallet → build → sign → broadcast."""
+    def test_fake_transport_order_success_path(self, monkeypatch):
+        """The adapter records a fake submit result; no SDK signing/broadcast occurs."""
         monkeypatch.setenv("DYDX_ENABLE_LIVE", "1")
         monkeypatch.setenv("DYDX_MNEMONIC", "word " * 24)
         monkeypatch.setenv("DYDX_ADDRESS", "dydx1test")
@@ -301,6 +302,7 @@ class TestLiveExecution:
         }
 
         with patch.object(dydx_mod, "_submit_market_order", return_value=mock_result):
+            monkeypatch.setattr(dydx_mod, "require_dry_run", lambda *_: None)
             results = v.execute_trades(
                 [{"symbol": "BTCUSDT", "type": "open_long", "amount_base": 0.01}],
                 {"BTCUSDT": {"price": 64000.0}},
@@ -315,8 +317,8 @@ class TestLiveExecution:
         assert r["venue"] == "dydx"
         assert r["error"] is None
 
-    def test_live_order_sdk_error_returns_failed(self, monkeypatch):
-        """SDK raises on broadcast → record.status == 'failed'."""
+    def test_fake_transport_error_returns_failed(self, monkeypatch):
+        """A local fake submit error is reflected as a failed algorithm result."""
         monkeypatch.setenv("DYDX_ENABLE_LIVE", "1")
         monkeypatch.setenv("DYDX_MNEMONIC", "word " * 24)
         monkeypatch.setenv("DYDX_ADDRESS", "dydx1test")
@@ -331,6 +333,7 @@ class TestLiveExecution:
             "_submit_market_order",
             side_effect=RuntimeError("insufficient margin"),
         ):
+            monkeypatch.setattr(dydx_mod, "require_dry_run", lambda *_: None)
             results = v.execute_trades(
                 [{"symbol": "BTCUSDT", "type": "open_long", "amount_base": 0.01}],
                 {"BTCUSDT": {"price": 64000.0}},
@@ -339,8 +342,8 @@ class TestLiveExecution:
         assert results[0]["status"] == "failed"
         assert "insufficient margin" in results[0]["error"]
 
-    def test_live_order_no_market_meta(self, monkeypatch):
-        """Missing market metadata → failed."""
+    def test_fake_transport_path_without_market_meta_fails(self, monkeypatch):
+        """Missing market metadata is rejected before the fake submitter is reached."""
         monkeypatch.setenv("DYDX_ENABLE_LIVE", "1")
         monkeypatch.setenv("DYDX_MNEMONIC", "word " * 24)
         monkeypatch.setenv("DYDX_ADDRESS", "dydx1test")
@@ -349,10 +352,13 @@ class TestLiveExecution:
         v._wallet = type("W", (), {"address": "dydx1test"})()
         v._node = type("N", (), {})()
 
-        results = v.execute_trades(
-            [{"symbol": "ZZZUSDT", "type": "open_long", "amount_base": 0.01}],
-            {"ZZZUSDT": {"price": 1.0}},
-            dry_run=False,
-        )
+        with patch.object(dydx_mod, "_submit_market_order") as submit:
+            monkeypatch.setattr(dydx_mod, "require_dry_run", lambda *_: None)
+            results = v.execute_trades(
+                [{"symbol": "ZZZUSDT", "type": "open_long", "amount_base": 0.01}],
+                {"ZZZUSDT": {"price": 1.0}},
+                dry_run=False,
+            )
         assert results[0]["status"] == "failed"
         assert "no market metadata" in results[0]["error"]
+        submit.assert_not_called()

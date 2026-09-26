@@ -5,9 +5,8 @@ Implements the CexVenue interface subset used by pure_futures_executor /
 pure_futures_watcher. Read path (prices, meta, orderbook, funding) uses
 the v4-client SDK IndexerClient (public REST) directly. Read-side
 credentials are never required — markets, funding, and orderbook are
-public. Write path (balances, positions, orders) needs a wallet: live
-orders are gated behind an explicit `DYDX_ENABLE_LIVE=1` opt-in so the
-adapter stays safe-by-default in dry-run / CI flows.
+read. REAL order submission is unavailable in this build and is rejected by
+the shared execution policy regardless of credentials or environment flags.
 
 Live order submission uses the SDK Market + OrderId + place_order flow:
 quantums/subticks/clob_pair_id conversion is handled by the SDK's Market
@@ -18,7 +17,7 @@ Symbology: on-chain `BTC-USD` <-> CEX pair `BTCUSDT`. Mark price is the
 indexer `oraclePrice` (independent of the off-chain CEX index — see
 scripts/core/cross_interval_funding.py for the basis-blend model).
 
-Credentials (live, all required; opt-in via DYDX_ENABLE_LIVE=1):
+Credentials (secure store only; never consulted for live orders in this build):
     DYDX_MNEMONIC           — 24-word BIP-39 mnemonic
     DYDX_ADDRESS            — dYdX bech32 address (dydx1...)
     DYDX_SUBACCOUNT_NUMBER  — subaccount to trade on (default 0)
@@ -36,6 +35,9 @@ import os
 import time
 from decimal import Decimal
 from typing import Any
+
+from core.credentials import redact_secret_values
+from core.execution_policy import block_real_execution, require_dry_run
 
 from venues.dydx_funding import DydxFundingProvider
 
@@ -206,6 +208,7 @@ def _submit_market_order(
     Returns {order_id, tx_hash, latency_ms} on success.
     Raises on any failure so the caller can set record["status"] = "failed".
     """
+    block_real_execution("dYdX order submission")
     assert _market_cls is not None
     assert _order_flags_cls is not None
     assert _order_type_cls is not None
@@ -422,12 +425,12 @@ class DydxVenue:
         try:
             wallet, node = self._ensure_wallet()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("dYdX wallet setup failed (%s); returning 0", exc)
+            logger.warning("dYdX wallet setup failed (%s); returning 0", redact_secret_values(exc))
             return {"spot": 0.0, "futures": 0.0}
         try:
             sub = _run(node.account.get_subaccount(wallet.address, self._subaccount))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("dYdX balance fetch failed (%s); returning 0", exc)
+            logger.warning("dYdX balance fetch failed (%s); returning 0", redact_secret_values(exc))
             return {"spot": 0.0, "futures": 0.0}
         sub_dict = (sub or {}).get("subaccount", {}) if isinstance(sub, dict) else {}
         try:
@@ -453,7 +456,7 @@ class DydxVenue:
                 )
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("dYdX positions fetch failed (%s); returning []", exc)
+            logger.warning("dYdX positions fetch failed (%s); returning []", redact_secret_values(exc))
             return []
         rows = (out or {}).get("positions", []) if isinstance(out, dict) else []
         if not isinstance(rows, list):
@@ -526,14 +529,10 @@ class DydxVenue:
             open_short / close_long  -> SELL
 
         dry_run=True: simulate with ref_price; record shape matches HL.
-        dry_run=False: requires DYDX_ENABLE_LIVE=1; live path is gated
-        behind an explicit opt-in because dYdX v4's order-placement flow
-        involves signing a Cosmos protobuf message with quantums /
-        subticks / clob_pair_id — a sufficiently nuanced builder to land
-        here without end-to-end testnet coverage. We surface the
-        failure mode as a "failed" record rather than swallow it, so
-        the executor / watcher can detect and stop.
+        dry_run=False: rejected by the shared safety policy. No environment
+        or credential opt-in can enable REAL order submission in this build.
         """
+        require_dry_run(dry_run, "dYdX order execution")
         results: list[dict[str, Any]] = []
         for trade in trades:
             symbol = trade["symbol"]
@@ -614,6 +613,6 @@ class DydxVenue:
             except Exception as exc:  # noqa: BLE001
                 record["status"] = "failed"
                 record["order_id"] = None
-                record["error"] = str(exc)
+                record["error"] = redact_secret_values(exc)
             results.append(record)
         return results

@@ -12,6 +12,7 @@ import { GridComponent, TooltipComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import VChart from 'vue-echarts'
 import { getBacktestHistory, post, getVenues, type BacktestResult, type BacktestTrade } from '@/composables/useApi'
+import { apiFetch } from '@/composables/apiAuth'
 import { useI18n } from 'vue-i18n'
 
 // Lazy-load echarts only when needed (reduces initial bundle)
@@ -166,7 +167,7 @@ async function runBacktest() {
 
 async function syncFromStrategy() {
   try {
-    const resp = await fetch('/api/settings/strategy')
+    const resp = await apiFetch('/api/settings/strategy')
     const json = await resp.json()
     if (json.success && json.data) {
       const s = json.data

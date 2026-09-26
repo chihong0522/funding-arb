@@ -63,7 +63,7 @@ install_python_deps() {
 install_node_deps() {
     if [ ! -d "web/node_modules" ]; then
         info "Installing Node.js dependencies..."
-        cd web && npm install && cd ..
+        cd web && npm ci && cd ..
     fi
     ok "Node.js dependencies ready"
 }

@@ -1,4 +1,5 @@
 import { ref, reactive, onMounted, onUnmounted } from "vue";
+import { apiFetch } from "@/composables/apiAuth";
 
 // ─── Types ─────────────────────────────────────────────────────
 
@@ -141,7 +142,7 @@ async function fetchVenueBalance(
 ): Promise<number> {
   try {
     const net = testnet ? "&network=testnet" : "&network=mainnet";
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/settings/wallet/balance?venue=${venue}&address=${encodeURIComponent(address)}${net}`,
     );
     const json = await resp.json();

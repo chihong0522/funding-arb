@@ -6,6 +6,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -15,6 +17,7 @@ from accounting.futures.delta_neutral_portfolio import (
     default_futures_state,
     normalize_executed_for_ledger,
 )
+from core.execution_policy import LiveExecutionDisabled
 from execution.run_cash_and_carry import apply_live_safety
 from strategies.futures.cash_and_carry import decide_cash_and_carry
 from strategies.futures.cross_asset_arbitrage import decide_cross_asset_arbitrage
@@ -40,22 +43,20 @@ def _base_cfg(**over):
     return {"cash": "USDT", "crossAssetArbitrage": cc}
 
 
-def test_apply_live_safety_disables_reverse():
+def test_cash_and_carry_live_config_is_rejected_even_with_reverse_opt_in():
     cfg = {
         "dry_run": False,
         "crossAssetArbitrage": {"reverseEntryFundingRatePct": -0.05},
     }
-    out = apply_live_safety(cfg)
-    assert out["crossAssetArbitrage"]["reverseEntryFundingRatePct"] == -999.0
+    with pytest.raises(LiveExecutionDisabled):
+        apply_live_safety(cfg)
     cfg2 = {
         "dry_run": False,
         "enableReverseArbitrage": True,
         "crossAssetArbitrage": {"reverseEntryFundingRatePct": -0.05},
     }
-    assert (
-        apply_live_safety(cfg2)["crossAssetArbitrage"]["reverseEntryFundingRatePct"]
-        == -0.05
-    )
+    with pytest.raises(LiveExecutionDisabled):
+        apply_live_safety(cfg2)
 
 
 def test_funding_direction():
@@ -201,7 +202,7 @@ def test_weighted_entry_price_on_addon():
 
 
 if __name__ == "__main__":
-    test_apply_live_safety_disables_reverse()
+    test_cash_and_carry_live_config_is_rejected_even_with_reverse_opt_in()
     test_funding_direction()
     test_hold_when_funding_missing()
     test_close_perp_only_when_spot_missing()

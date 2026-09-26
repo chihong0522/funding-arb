@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # Make the project root and scripts/ importable so we can use existing
@@ -24,8 +25,17 @@ for _p in (str(_ROOT_DIR), str(_SCRIPTS_DIR)):
         sys.path.insert(0, _p)
 
 # ---------------------------------------------------------------------------
-# Routers
+# Routers and security policy
 # ---------------------------------------------------------------------------
+from server.security import (  # noqa: E402
+    allowed_browser_origins,
+    configured_api_token,
+    is_api_authorized,
+    is_origin_allowed,
+    is_websocket_authorized,
+    request_requires_auth,
+    websocket_events_subprotocol,
+)
 from server.routes import backtest, positions, scanner, settings  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -39,8 +49,8 @@ class ConnectionManager:
     def __init__(self) -> None:
         self._connections: list[WebSocket] = []
 
-    async def connect(self, ws: WebSocket) -> None:
-        await ws.accept()
+    async def connect(self, ws: WebSocket, subprotocol: str | None = None) -> None:
+        await ws.accept(subprotocol=subprotocol)
         self._connections.append(ws)
 
     def disconnect(self, ws: WebSocket) -> None:
@@ -173,16 +183,41 @@ app = FastAPI(title="funding-arb API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:1420",
-        "http://127.0.0.1:1420",
-        "http://localhost:5173",
-        "tauri://localhost",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=sorted(allowed_browser_origins()),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
 )
+
+
+@app.middleware("http")
+async def enforce_api_security(request, call_next):
+    """Reject untrusted browser origins and authenticate API control routes."""
+    origin = request.headers.get("origin")
+    if not is_origin_allowed(origin):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Browser origin is not allowed"},
+        )
+
+    if request_requires_auth(request.url.path, request.method):
+        if configured_api_token() is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Control API is disabled; configure a high-entropy "
+                    "FUNDING_ARB_API_TOKEN to enable it"
+                },
+            )
+        if not is_api_authorized(request.headers.get("authorization")):
+            return JSONResponse(
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+                content={"detail": "Bearer authentication required"},
+            )
+
+    return await call_next(request)
 
 app.include_router(scanner.router, prefix="/api")
 app.include_router(positions.router, prefix="/api")
@@ -197,7 +232,22 @@ app.include_router(settings.router, prefix="/api")
 
 @app.websocket("/ws/events")
 async def ws_events(ws: WebSocket):
-    await manager.connect(ws)
+    """Authenticated event stream; browser clients must also use an allowed origin."""
+    origin = ws.headers.get("origin")
+    if not is_origin_allowed(origin):
+        await ws.close(code=4403, reason="Browser origin is not allowed")
+        return
+    if configured_api_token() is None:
+        await ws.close(code=1013, reason="Control API authentication is not configured")
+        return
+    protocol_header = ws.headers.get("sec-websocket-protocol")
+    if not is_websocket_authorized(
+        ws.headers.get("authorization"), protocol_header
+    ):
+        await ws.close(code=4401, reason="Authentication required")
+        return
+
+    await manager.connect(ws, websocket_events_subprotocol(protocol_header))
     try:
         while True:
             try:

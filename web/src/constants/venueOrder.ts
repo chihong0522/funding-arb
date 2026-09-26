@@ -4,6 +4,9 @@
  */
 export const CEX_VENUE_RANK = ["binance", "okx", "bybit", "bitget"] as const;
 
+/** Only venues with frontend-supported CEX credential flows are enabled for UI actions. */
+export const SUPPORTED_CEX_UI_VENUES = ["binance", "bybit"] as const;
+
 /** Perp-DEX by typical open-interest / volume tier (HL > dYdX > …). */
 export const DEX_VENUE_RANK = [
   "hyperliquid",

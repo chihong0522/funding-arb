@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Credential loader: ~/.funding-arb store."""
+"""Credential provider ignores legacy plaintext files."""
 
 from __future__ import annotations
 
@@ -19,31 +19,31 @@ def _write_json(path: Path, env: dict) -> None:
     path.write_text(json.dumps({"env": env}), encoding="utf-8")
 
 
-def test_json_loads_values(tmp_path, monkeypatch):
+def _isolate_secure_stores(monkeypatch) -> None:
+    monkeypatch.setattr(creds, "_load_keyring", lambda: {})
+    monkeypatch.setattr(creds, "_load_age", lambda: {})
+    monkeypatch.setattr(creds, "_load_systemd_creds", lambda: {})
+    monkeypatch.setattr(creds, "_cache", None)
+
+
+def test_plaintext_json_credentials_are_not_loaded(tmp_path, monkeypatch):
     store = tmp_path / "funding-arb" / "credentials.json"
     _write_json(store, {"BINANCE_API_KEY": "k", "OKX_API_KEY": "o"})
-    monkeypatch.setattr(creds, "_JSON_FILES", [store])
+    _isolate_secure_stores(monkeypatch)
 
-    out = creds._load_json()
-    assert out["BINANCE_API_KEY"] == "k"
-    assert out["OKX_API_KEY"] == "o"
+    assert creds._load_all() == {}
+    assert not hasattr(creds, "_load_json")
 
 
-def test_missing_files_return_empty(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        creds, "_JSON_FILES", [tmp_path / "a.json", tmp_path / "b.json"]
-    )
-    assert creds._load_json() == {}
+def test_missing_secure_credentials_return_empty(monkeypatch):
+    _isolate_secure_stores(monkeypatch)
+    assert creds._load_all() == {}
 
 
 def test_ensure_env_does_not_overwrite_existing_env(tmp_path, monkeypatch):
     new = tmp_path / "credentials.json"
     _write_json(new, {"BITGET_API_KEY": "from-file"})
-    monkeypatch.setattr(creds, "_JSON_FILES", [new])
-    monkeypatch.setattr(creds, "_load_keyring", lambda: {})
-    monkeypatch.setattr(creds, "_load_age", lambda: {})
-    monkeypatch.setattr(creds, "_load_systemd_creds", lambda: {})
-    monkeypatch.setattr(creds, "_cache", None)
+    _isolate_secure_stores(monkeypatch)
     monkeypatch.setattr(creds, "_loaded", False)
     monkeypatch.setenv("BITGET_API_KEY", "from-env")
 

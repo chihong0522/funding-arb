@@ -44,6 +44,7 @@ from backtest.unified_funding_pool import (  # noqa: E402
     UnifiedFundingPool,
 )
 from execution.cross_venue_executor import open_cross_venue_position  # noqa: E402
+from core.execution_policy import LiveExecutionDisabled, require_dry_run  # noqa: E402
 from transfer.cross_venue_router import build_plan, execute_plan  # noqa: E402
 from transfer.transfer_providers import (  # noqa: E402
     get_transfer_provider,
@@ -255,7 +256,7 @@ def _execution_notes(route: CrossRoute, trade_usd: float) -> list[str]:
                 f"(est fee {route.transfer_fee_usdt:.4f} USDT / {route.transfer_fee_pct:.3f}%)"
             )
         notes.append(
-            "Cross-venue auto-trade: --run-executor simulates both legs, --run-executor --live-trades opens live"
+            "Cross-venue auto-trade: --run-executor simulates both legs; live order execution is disabled",
         )
     return notes
 
@@ -587,7 +588,7 @@ def main() -> None:
     parser.add_argument(
         "--execute-transfer",
         action="store_true",
-        help="Initiate live on-chain withdrawal (default: show plan only)",
+        help="disabled: live withdrawals are rejected (default: show plan only)",
     )
     parser.add_argument(
         "--poll-deposit",
@@ -604,7 +605,7 @@ def main() -> None:
     parser.add_argument(
         "--live-trades",
         action="store_true",
-        help="Cross-venue live order execution (default: both legs dry-run simulated)",
+        help="disabled: real order requests are rejected (default: both legs dry-run simulated)",
     )
     parser.add_argument("--config", default="", help="Config file path")
     parser.add_argument("--verbose", "-V", action="store_true")
@@ -643,6 +644,13 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    try:
+        require_dry_run(
+            not (args.execute_transfer or args.live_trades),
+            "orchestration orders/transfers",
+        )
+    except LiveExecutionDisabled as exc:
+        parser.error(str(exc))
 
     # ── Pure Futures fast path ────────────────────────────────────────────
     if args.pure_futures:

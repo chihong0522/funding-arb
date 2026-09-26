@@ -7,9 +7,13 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import execution.pure_futures_executor as pure_futures_executor  # noqa: E402
+from core.execution_policy import LiveExecutionDisabled  # noqa: E402
 from execution.pure_futures_executor import (  # noqa: E402
     close_pure_futures_leg,
     close_pure_futures_pair,
@@ -102,6 +106,45 @@ class FakeFuturesVenue:
         return out
 
 
+class FakeSafeExecutionJournal:
+    """Local journal double for state-machine tests; not live reconciliation."""
+
+    def __init__(self, ledger_path: Path):
+        self.ledger_path = ledger_path
+        self.events: list[tuple] = []
+
+    def has_unresolved_work(self) -> bool:
+        return False
+
+    def blocking_reasons(self) -> list[str]:
+        return []
+
+    def begin_operation(self, operation_id: str, kind: str, **details) -> None:
+        self.events.append(("begin", operation_id, kind, details))
+
+    def finish_operation(self, operation_id: str, outcome: str) -> None:
+        self.events.append(("finish", operation_id, outcome))
+
+    def record_incident(self, operation_id: str, reason: str, details: dict) -> str:
+        self.events.append(("incident", operation_id, reason, details))
+        return f"fake-incident-{len(self.events)}"
+
+
+def _allow_fake_state_machine(monkeypatch, *venues) -> None:
+    """Patch local execution seams only after every injected venue is a fake."""
+    if not venues or any(not isinstance(venue, FakeFuturesVenue) for venue in venues):
+        raise AssertionError("state-machine tests must inject only FakeFuturesVenue objects")
+
+    def submit_fake(venue, trade, market, **_kwargs):
+        if not isinstance(venue, FakeFuturesVenue):
+            raise AssertionError("fake journaled submit received a non-fake venue")
+        return venue.execute_trades([trade], market, dry_run=False)
+
+    monkeypatch.setattr(pure_futures_executor, "require_dry_run", lambda *_: None)
+    monkeypatch.setattr(pure_futures_executor, "execute_journaled_trade", submit_fake)
+    monkeypatch.setattr(pure_futures_executor, "SafeExecutionJournal", FakeSafeExecutionJournal)
+
+
 def _path(name: str) -> Path:
     TMP.mkdir(parents=True, exist_ok=True)
     p = TMP / f"{name}.json"
@@ -141,9 +184,10 @@ def test_dry_run_open_and_close_records_position():
     assert rows[0]["status"] == "closed"
 
 
-def test_live_open_both_legs_filled():
-    path = _path("live")
+def test_fake_transport_open_both_legs_filled(monkeypatch):
+    path = _path("fake_open")
     lv, sv = FakeFuturesVenue("okx"), FakeFuturesVenue("bybit")
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "ETH",
         "okx",
@@ -162,8 +206,8 @@ def test_live_open_both_legs_filled():
     assert rows[0]["qty"] > 0
 
 
-def test_close_single_leg_only_touches_that_venue():
-    """Single-leg gone scenario: only place close order on surviving leg (ordering on the vanished leg would open a new reverse position)."""
+def test_live_single_leg_close_is_blocked_before_fake_venue_side_effects():
+    """Emergency single-leg closes remain unavailable even with injected fakes."""
     path = _path("single_leg")
     lv, sv = FakeFuturesVenue("okx"), FakeFuturesVenue("bybit")
     res = open_pure_futures_pair(
@@ -171,7 +215,7 @@ def test_close_single_leg_only_touches_that_venue():
         "okx",
         "bybit",
         500,
-        dry_run=False,
+        dry_run=True,
         long_venue=lv,
         short_venue=sv,
         positions_path=path,
@@ -180,53 +224,25 @@ def test_close_single_leg_only_touches_that_venue():
     lv.trades.clear()
     sv.trades.clear()
 
-    # long leg force-liquidated → only close short leg
-    res2 = close_pure_futures_leg(
-        res.position_id,
-        "short",
-        long_venue=lv,
-        short_venue=sv,
-        positions_path=path,
-        close_reason="emergency: long_leg_gone@okx",
-    )
-    assert res2.ok and res2.state == "filled"
-    assert lv.trades == []  # vanished leg must never receive orders
-    assert [t["type"] for t in sv.trades] == ["close_short"]
-    rows = load_pure_futures_positions(path)
-    assert rows[0]["status"] == "closed"
-    assert rows[0]["close_info"]["single_leg"] == "short"
+    with pytest.raises(LiveExecutionDisabled):
+        close_pure_futures_leg(
+            res.position_id,
+            "short",
+            long_venue=lv,
+            short_venue=sv,
+            positions_path=path,
+            close_reason="synthetic single-leg safety check",
+        )
+    assert lv.trades == [] and sv.trades == []
+    assert lv.initialized == [] and sv.initialized == []
+    assert load_pure_futures_positions(path)[0]["status"] == "open"
 
 
-def test_close_single_leg_failure_keeps_position_open():
-    path = _path("single_leg_fail")
-    lv = FakeFuturesVenue("okx")
-    sv = FakeFuturesVenue("bybit", fail_types={"close_short"})
-    res = open_pure_futures_pair(
-        "BTC",
-        "okx",
-        "bybit",
-        500,
-        dry_run=False,
-        long_venue=lv,
-        short_venue=sv,
-        positions_path=path,
-    )
-    res2 = close_pure_futures_leg(
-        res.position_id,
-        "short",
-        long_venue=lv,
-        short_venue=sv,
-        positions_path=path,
-    )
-    assert not res2.ok and res2.state == "naked"
-    rows = load_pure_futures_positions(path)
-    assert rows[0]["status"] == "open"  # left for manual/next-cycle handling
-
-
-def test_short_leg_fail_rolls_back_long():
+def test_fake_transport_short_leg_failure_rolls_back_long(monkeypatch):
     path = _path("rollback_open")
     lv = FakeFuturesVenue("okx")
     sv = FakeFuturesVenue("bybit", fail_types={"open_short"})
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -242,10 +258,11 @@ def test_short_leg_fail_rolls_back_long():
     assert load_pure_futures_positions(path) == []
 
 
-def test_short_leg_fail_and_rollback_fail_is_naked():
+def test_fake_transport_rollback_failure_persists_recovery_required_position(monkeypatch):
     path = _path("naked_open")
     lv = FakeFuturesVenue("okx", fail_types={"close_long"})
     sv = FakeFuturesVenue("bybit", fail_types={"open_short"})
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -256,13 +273,19 @@ def test_short_leg_fail_and_rollback_fail_is_naked():
         short_venue=sv,
         positions_path=path,
     )
-    assert not res.ok and res.state == "naked"
+    assert not res.ok and res.state == "recovery_required"
+    rows = load_pure_futures_positions(path)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "recovery_required"
+    assert rows[0]["recovery_required"] is True
+    assert rows[0]["long_qty"] > 0 and rows[0]["short_qty"] == 0
 
 
-def test_close_long_fail_reopens_short():
+def test_fake_transport_close_failure_reopens_short(monkeypatch):
     path = _path("rollback_close")
     lv = FakeFuturesVenue("okx")
     sv = FakeFuturesVenue("bybit")
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -306,8 +329,9 @@ def test_mark_spread_gate_aborts():
     assert "mark spread" in res.logs[0]
 
 
-def _open_live(path: Path) -> tuple:
+def _open_with_fake_transports(path: Path, monkeypatch) -> tuple:
     lv, sv = FakeFuturesVenue("okx"), FakeFuturesVenue("bybit")
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -322,9 +346,9 @@ def _open_live(path: Path) -> tuple:
     return lv, sv, res.position_id
 
 
-def test_rebalance_balanced_is_noop():
+def test_fake_transport_rebalance_balanced_is_noop(monkeypatch):
     path = _path("rebal_noop")
-    lv, sv, pid = _open_live(path)
+    lv, sv, pid = _open_with_fake_transports(path, monkeypatch)
     res = rebalance_pure_futures_pair(
         pid,
         dry_run=False,
@@ -340,9 +364,9 @@ def test_rebalance_balanced_is_noop():
     assert [t["type"] for t in sv.trades] == ["open_short"]
 
 
-def test_rebalance_trims_long_leg():
+def test_fake_transport_rebalance_trims_long_leg(monkeypatch):
     path = _path("rebal_trim_long")
-    lv, sv, pid = _open_live(path)
+    lv, sv, pid = _open_with_fake_transports(path, monkeypatch)
     res = rebalance_pure_futures_pair(
         pid,
         dry_run=False,
@@ -362,9 +386,9 @@ def test_rebalance_trims_long_leg():
     assert pos["last_rebalance"]["venue"] == "okx"
 
 
-def test_rebalance_trims_short_leg():
+def test_fake_transport_rebalance_trims_short_leg(monkeypatch):
     path = _path("rebal_trim_short")
-    lv, sv, pid = _open_live(path)
+    lv, sv, pid = _open_with_fake_transports(path, monkeypatch)
     res = rebalance_pure_futures_pair(
         pid,
         dry_run=False,
@@ -381,9 +405,9 @@ def test_rebalance_trims_short_leg():
     assert load_pure_futures_positions(path)[0]["qty"] == 3.0
 
 
-def test_rebalance_trim_failure_aborts():
+def test_fake_transport_rebalance_trim_failure_aborts(monkeypatch):
     path = _path("rebal_fail")
-    lv, sv, pid = _open_live(path)
+    lv, sv, pid = _open_with_fake_transports(path, monkeypatch)
     lv.fail_types.add("close_long")
     res = rebalance_pure_futures_pair(
         pid,
@@ -400,9 +424,9 @@ def test_rebalance_trim_failure_aborts():
     assert "last_rebalance" not in pos
 
 
-def test_rebalance_leg_gone_aborts():
+def test_fake_transport_rebalance_leg_gone_aborts(monkeypatch):
     path = _path("rebal_gone")
-    lv, sv, pid = _open_live(path)
+    lv, sv, pid = _open_with_fake_transports(path, monkeypatch)
     res = rebalance_pure_futures_pair(
         pid,
         dry_run=False,
@@ -415,11 +439,12 @@ def test_rebalance_leg_gone_aborts():
     assert not res.ok and res.state == "aborted"
 
 
-def test_open_aborts_when_margin_insufficient():
+def test_fake_transport_open_aborts_when_margin_insufficient(monkeypatch):
     """Both venues have insufficient balance → abort without placing any orders."""
     path = _path("margin_insufficient")
     lv = FakeFuturesVenue("okx", balances={"spot": 0.0, "futures": 100.0})
     sv = FakeFuturesVenue("bybit", balances={"spot": 0.0, "futures": 100.0})
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -432,14 +457,16 @@ def test_open_aborts_when_margin_insufficient():
     )
     assert not res.ok and res.state == "aborted"
     assert lv.trades == [] and sv.trades == []
-    assert any("insufficient margin" in log for log in res.logs)
+    assert any("insufficient pre-funded futures margin" in log for log in res.logs)
 
 
-def test_open_transfers_shortfall_from_spot():
-    """futures insufficient but spot can cover → transfer shortfall then open normally."""
-    path = _path("margin_transfer")
+def test_fake_transport_open_never_transfers_spot_shortfall(monkeypatch):
+    """Spot funds do not permit an automatic transfer into underfunded futures."""
+    path = _path("margin_no_transfer")
     lv = FakeFuturesVenue("okx", balances={"spot": 1000.0, "futures": 100.0})
     sv = FakeFuturesVenue("bybit", balances={"spot": 1000.0, "futures": 600.0})
+    _allow_fake_state_machine(monkeypatch, lv, sv)
+    balances_before = (dict(lv.balances), dict(sv.balances))
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -450,19 +477,20 @@ def test_open_transfers_shortfall_from_spot():
         short_venue=sv,
         positions_path=path,
     )
-    assert res.ok and res.state == "filled"
-    # okx transfers shortfall 525 - 100 = 425; bybit 600 ≥ 525 no transfer needed
-    assert len(lv.transfers) == 1
-    assert abs(lv.transfers[0][1] - 425.0) < 1e-9
-    assert sv.transfers == []
+    assert not res.ok and res.state == "aborted"
+    assert lv.trades == [] and sv.trades == []
+    assert lv.transfers == [] and sv.transfers == []
+    assert (lv.balances, sv.balances) == balances_before
+    assert any("insufficient pre-funded futures margin" in log for log in res.logs)
 
 
-def test_open_margin_includes_capital_buffer():
+def test_fake_transport_open_margin_includes_capital_buffer(monkeypatch):
     """capital_buffer_pct is included in margin requirement."""
     path = _path("margin_buffer")
     # Balance just meets 1.05x but not 1.05x + 10% buffer
     lv = FakeFuturesVenue("okx", balances={"spot": 0.0, "futures": 530.0})
     sv = FakeFuturesVenue("bybit", balances={"spot": 0.0, "futures": 530.0})
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -489,8 +517,8 @@ def test_open_margin_includes_capital_buffer():
     assert res2.ok
 
 
-def test_open_margin_check_skipped_when_api_fails():
-    """Balance API fails → skip check and allow through (don't block trading)."""
+def test_fake_transport_open_aborts_when_balance_query_fails(monkeypatch):
+    """Unknown balance state fails closed and places no fake venue orders."""
     path = _path("margin_api_fail")
     lv = FakeFuturesVenue("okx")
     sv = FakeFuturesVenue("bybit")
@@ -499,6 +527,7 @@ def test_open_margin_check_skipped_when_api_fails():
         raise RuntimeError("api down")
 
     lv.fetch_usdt_account_balances = _boom
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -509,15 +538,17 @@ def test_open_margin_check_skipped_when_api_fails():
         short_venue=sv,
         positions_path=path,
     )
-    assert res.ok and res.state == "filled"
-    assert any("skipping check" in log for log in res.logs)
+    assert not res.ok and res.state == "aborted"
+    assert lv.trades == [] and sv.trades == []
+    assert any("balance query failed; refusing open" in log for log in res.logs)
 
 
-def test_close_spread_normal_no_warning():
+def test_fake_transport_close_spread_normal_no_warning(monkeypatch):
     """Spread is normal at close (not significantly widened) → no WARN log, normal close."""
     path = _path("close_spread_ok")
     lv = FakeFuturesVenue("okx", price=100.0)
     sv = FakeFuturesVenue("bybit", price=101.0)  # opening spread ~1%
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -548,11 +579,12 @@ def test_close_spread_normal_no_warning():
     assert "close_mark_spread" in pos["close_info"]
 
 
-def test_close_spread_widened_warns():
+def test_fake_transport_close_spread_widened_warns(monkeypatch):
     """Spread widens beyond threshold → still closes normally, but logs contain WARN."""
     path = _path("close_spread_warn")
     lv = FakeFuturesVenue("okx", price=100.0)
     sv = FakeFuturesVenue("bybit", price=100.5)  # opening spread ~0.5%
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",
@@ -585,11 +617,12 @@ def test_close_spread_widened_warns():
     )
 
 
-def test_close_no_mark_spread_field_graceful():
+def test_fake_transport_close_no_mark_spread_field_graceful(monkeypatch):
     """position record has no mark_spread_pct → no error, graceful degradation."""
     path = _path("close_no_spread")
     lv = FakeFuturesVenue("okx", price=100.0)
     sv = FakeFuturesVenue("bybit", price=100.5)
+    _allow_fake_state_machine(monkeypatch, lv, sv)
     res = open_pure_futures_pair(
         "BTC",
         "okx",

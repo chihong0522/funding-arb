@@ -23,6 +23,7 @@ from execution.pure_futures_executor import (  # noqa: E402
     load_pure_futures_positions,
     open_pure_futures_pair,
 )
+from core.execution_policy import LiveExecutionDisabled, block_real_execution  # noqa: E402
 
 
 def _print_result(result) -> None:
@@ -47,19 +48,25 @@ def main() -> int:
     )
     op.add_argument("--max-mark-spread-pct", type=float, default=1.0)
     op.add_argument("--dry-run", action="store_true", help="simulate only")
-    op.add_argument("--live", action="store_true", help="submit live orders")
+    op.add_argument("--live", action="store_true", help="disabled: live order requests are rejected")
 
     cl = sub.add_parser("close", help="close an open pure futures pair")
     cl.add_argument("position_id")
     cl.add_argument("--quote", default="USDT")
     cl.add_argument("--dry-run", action="store_true", help="simulate close")
-    cl.add_argument("--live", action="store_true", help="submit live orders")
+    cl.add_argument("--live", action="store_true", help="disabled: live order requests are rejected")
 
     ls = sub.add_parser("list", help="list pure futures positions")
     ls.add_argument("--all", action="store_true", help="include closed positions")
     ls.add_argument("--json", action="store_true")
 
     args = p.parse_args()
+    if args.cmd in {"open", "close"} and args.live:
+        try:
+            block_real_execution("manual CLI order")
+        except LiveExecutionDisabled as exc:
+            p.error(str(exc))
+
     if args.cmd == "open":
         if args.live and args.dry_run:
             p.error("--live and --dry-run are mutually exclusive")

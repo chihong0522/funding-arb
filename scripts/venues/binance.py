@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import json
 import os
-import random
+import re
 import sys
 import time
 import urllib.error
@@ -16,11 +16,12 @@ import urllib.request
 from typing import Any, Optional
 
 from core.config import resolve_timeframes
+from core.credentials import ensure_env, redact_secret_values
+from core.execution_policy import block_real_execution, require_dry_run
 from venues.base import make_pair
-from venues.http_util import credentials_file, parse_kline_ohlcv, rules_for_price
+from venues.http_util import parse_kline_ohlcv, rules_for_price
 
 BASE = "https://api.binance.com"
-CONFIG_PATH = credentials_file()
 _symbol_rules_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _futures_rules_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _exchange_info_loaded_at: float = 0.0
@@ -45,16 +46,7 @@ def _ensure_env() -> None:
     global _env_loaded
     if _env_loaded:
         return
-    if os.environ.get("BINANCE_API_KEY"):
-        _env_loaded = True
-        return
-    try:
-        with open(CONFIG_PATH) as f:
-            for k, v in json.load(f).get("env", {}).items():
-                if v and k not in os.environ:
-                    os.environ[k] = str(v)
-    except (OSError, json.JSONDecodeError):
-        pass
+    ensure_env("BINANCE_")
     _env_loaded = True
 
 
@@ -84,6 +76,8 @@ def _sign(query: str) -> str:
 def _api_call(
     method: str, path: str, params: Optional[dict] = None, signed: bool = False
 ) -> Any:
+    if method.upper() != "GET":
+        block_real_execution("Binance REST write")
     base_params = dict(params or {})
     if signed:
         # Credential validation: fail immediately on missing credentials; never send private requests with empty credentials
@@ -91,7 +85,7 @@ def _api_call(
         if not (key and secret):
             raise RuntimeError(
                 "Binance API credentials missing: please set BINANCE_API_KEY / BINANCE_API_SECRET, "
-                "or configure them in ~/.funding-arb/credentials.json under env."
+                "or configure them in an approved secure credential store."
             )
     # GET can be safely retried; POST (orders) are not retried to avoid duplicate orders
     retries = 3 if method == "GET" else 1
@@ -115,11 +109,11 @@ def _api_call(
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read().decode())
         except Exception as e:
-            last_err = e
+            last_err = RuntimeError(redact_secret_values(e))
             if method == "GET" and attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
                 continue
-            raise
+            raise last_err from None
     raise last_err if last_err else RuntimeError("binance _api_call failed")
 
 
@@ -313,6 +307,7 @@ class BinanceSpotVenue:
         self, asset: str, amount: float, from_account: str, to_account: str
     ) -> bool:
         """Transfer between main spot and UM futures."""
+        block_real_execution("internal transfer")
         # 1: spot -> UM futures, 2: UM futures -> spot
         transfer_type = (
             1
@@ -349,7 +344,7 @@ class BinanceSpotVenue:
                     spot_usdt = float(asset.get("free", "0"))
                     break
         except Exception as e:
-            print(f"fetch_usdt_account_balances spot error: {e}", file=sys.stderr)
+            print(f"fetch_usdt_account_balances spot error: {redact_secret_values(e)}", file=sys.stderr)
             raise e
 
         futures_usdt = 0.0
@@ -360,7 +355,7 @@ class BinanceSpotVenue:
                     futures_usdt = float(asset.get("availableBalance", "0"))
                     break
         except Exception as e:
-            print(f"fetch_usdt_account_balances futures error: {e}", file=sys.stderr)
+            print(f"fetch_usdt_account_balances futures error: {redact_secret_values(e)}", file=sys.stderr)
             raise e
 
         return {"spot": spot_usdt, "futures": futures_usdt}
@@ -432,41 +427,45 @@ class BinanceSpotVenue:
                     if str(asset.get("asset", "")).upper() == "USDT":
                         balances["USDT"] += float(asset.get("marginBalance", "0"))
             except Exception as e:
-                print(f"fetch_futures_balances error: {e}", file=sys.stderr)
+                print(f"fetch_futures_balances error: {redact_secret_values(e)}", file=sys.stderr)
 
         return balances
 
     def initialize_futures_symbol(self, pair: str) -> None:
-        """Initialize futures configuration (marginType, leverage, positionSide) for a specific pair."""
-        if pair in _initialized_symbols:
-            return
-        try:
-            _api_call(
-                "POST",
-                "/fapi/v1/marginType",
-                {"symbol": pair, "marginType": "ISOLATED"},
-                signed=True,
+        """Require safe, preconfigured futures settings without mutating account state."""
+        mode = _api_call("GET", "/fapi/v1/positionSide/dual", signed=True)
+        if not isinstance(mode, dict) or mode.get("dualSidePosition") is not False:
+            raise RuntimeError(
+                f"Binance futures position mode for {pair} is unknown or hedge; "
+                "one-way mode must be configured before execution"
             )
-        except Exception:
-            pass
-        try:
-            _api_call(
-                "POST",
-                "/fapi/v1/leverage",
-                {"symbol": pair, "leverage": 1},
-                signed=True,
-            )
-        except Exception:
-            pass
-        try:
-            _api_call(
-                "POST",
-                "/fapi/v1/positionSide/dual",
-                {"dualSidePosition": "false"},
-                signed=True,
-            )
-        except Exception:
-            pass
+
+        config = _api_call(
+            "GET", "/fapi/v1/symbolConfig", {"symbol": pair}, signed=True
+        )
+        if isinstance(config, list):
+            rows = config
+        elif isinstance(config, dict):
+            rows = [config]
+        else:
+            rows = []
+        row = next(
+            (item for item in rows if isinstance(item, dict) and item.get("symbol") == pair),
+            None,
+        )
+        if row is None:
+            raise RuntimeError(f"Binance futures configuration unavailable for {pair}")
+        if str(row.get("marginType", "")).upper() != "ISOLATED":
+            raise RuntimeError(f"Binance {pair} must be preconfigured for ISOLATED margin")
+        raw_leverage = row.get("leverage")
+        if not isinstance(raw_leverage, (str, int)):
+            raise RuntimeError(f"Binance {pair} leverage is unknown")
+        leverage = int(raw_leverage)
+        if leverage != 1:
+            raise RuntimeError(f"Binance {pair} must be preconfigured at 1x leverage")
+        if row.get("isAutoAddMargin") not in (False, "false", "0", 0):
+            raise RuntimeError(f"Binance {pair} auto-add margin must be disabled")
+
         _initialized_symbols.add(pair)
 
     def fetch_live_state(self, assets: list[str]) -> dict[str, Any]:
@@ -482,7 +481,7 @@ class BinanceSpotVenue:
                         asset.get("locked", "0")
                     )
         except Exception as e:
-            print(f"fetch_live_state spot error: {e}", file=sys.stderr)
+            print(f"fetch_live_state spot error: {redact_secret_values(e)}", file=sys.stderr)
             raise e  # Must propagate if spot fails
 
         # 2. Cross Margin Balances & Debt (for Reverse Arb)
@@ -515,7 +514,7 @@ class BinanceSpotVenue:
                     # Use walletBalance instead of marginBalance to avoid double-counting unrealized PnL
                     futures_usdt = float(asset.get("walletBalance", "0"))
         except Exception as e:
-            print(f"fetch_live_state futures account error: {e}", file=sys.stderr)
+            print(f"fetch_live_state futures account error: {redact_secret_values(e)}", file=sys.stderr)
             raise e
 
         if "USDT" in combined_balances:
@@ -546,7 +545,7 @@ class BinanceSpotVenue:
                         "leverage": lev,
                     }
         except Exception as e:
-            print(f"fetch_live_state positionRisk error: {e}", file=sys.stderr)
+            print(f"fetch_live_state positionRisk error: {redact_secret_values(e)}", file=sys.stderr)
             raise e
 
         return {"balances": combined_balances, "futures_positions": positions}
@@ -592,7 +591,7 @@ class BinanceSpotVenue:
     # ── cross margin (Reverse C&C: borrow-sell / buy-repay) ──────────────────────
 
     def supports_reverse_arbitrage(self) -> bool:
-        """Cross margin borrow/repay capability: assumed available without API keys; probes account when keys are present."""
+        """Cross-margin capability probe; it never changes account state or borrows."""
         if not (_get_key() and _get_secret()):
             return True
         try:
@@ -616,6 +615,7 @@ class BinanceSpotVenue:
         return debt
 
     def _margin_borrow_repay(self, asset: str, amount: float, op: str) -> bool:
+        block_real_execution("margin borrow/repay")
         try:
             res = _api_call(
                 "POST",
@@ -630,7 +630,7 @@ class BinanceSpotVenue:
             )
             return "tranId" in res
         except Exception as e:
-            print(f"margin {op} {asset} failed: {e}", file=sys.stderr)
+            print(f"margin {op} {asset} failed: {redact_secret_values(e)}", file=sys.stderr)
             return False
 
     def margin_borrow(self, asset: str, amount: float) -> bool:
@@ -638,6 +638,136 @@ class BinanceSpotVenue:
 
     def margin_repay(self, asset: str, amount: float) -> bool:
         return self._margin_borrow_repay(asset, amount, "REPAY")
+
+    @staticmethod
+    def _order_paths(category: str) -> tuple[str, str]:
+        if category == "futures":
+            return "/fapi/v1/order", "/fapi/v1/order"
+        if category == "margin":
+            return "/sapi/v1/margin/order", "/sapi/v1/margin/order"
+        return "/api/v3/order", "/api/v3/order"
+
+    @staticmethod
+    def _make_client_order_id(value: str | None, prefix: str) -> str:
+        del prefix  # client IDs must be supplied by the durable execution journal.
+        if not value:
+            raise ValueError("client_order_id is required for journaled live execution")
+        client_id = value
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,36}", client_id):
+            raise ValueError("client_order_id must be 1-36 ASCII letters, digits, '_' or '-'")
+        return client_id
+
+    def _settle_market_order(
+        self,
+        *,
+        pair: str,
+        category: str,
+        client_order_id: str,
+        order_id: str | None,
+        requested_qty: float | None,
+        ref_price: float,
+        submit_ts: float,
+        submit_error: Exception | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        query_path, cancel_path = self._order_paths(category)
+        query_key = "orderId" if order_id and order_id != "?" else "origClientOrderId"
+        query_value = order_id if query_key == "orderId" else client_order_id
+        final_detail: dict[str, Any] = {}
+        query_error: Exception | None = None
+        canceled = False
+        for poll in range(3):
+            try:
+                final_detail = _api_call(
+                    "GET",
+                    query_path,
+                    {"symbol": pair, query_key: query_value},
+                    signed=True,
+                )
+            except Exception as exc:
+                query_error = exc
+                break
+            status = str(final_detail.get("status", "")).upper()
+            if status in {"NEW", "PARTIALLY_FILLED", "PENDING_CANCEL"}:
+                if not canceled:
+                    cancel_params = {"symbol": pair, query_key: query_value}
+                    try:
+                        _api_call("DELETE", cancel_path, cancel_params, signed=True)
+                    except Exception:
+                        pass
+                    canceled = True
+                if poll < 2:
+                    time.sleep(0.2)
+                    continue
+            elif status not in {
+                "FILLED",
+                "CANCELED",
+                "CANCELLED",
+                "REJECTED",
+                "EXPIRED",
+                "EXPIRED_IN_MATCH",
+            }:
+                if poll < 2:
+                    time.sleep(0.2)
+                    continue
+            break
+
+        try:
+            executed_qty = float(final_detail.get("executedQty", 0) or 0)
+            executed_quote = float(final_detail.get("cummulativeQuoteQty", 0) or 0)
+            avg_price = float(final_detail.get("avgPrice", 0) or 0)
+        except (TypeError, ValueError):
+            executed_qty = executed_quote = avg_price = 0.0
+        if avg_price <= 0 and executed_qty > 0 and executed_quote > 0:
+            avg_price = executed_quote / executed_qty
+        exchange_status = str(final_detail.get("status", "UNKNOWN")).upper()
+        known_terminal = exchange_status in {
+            "FILLED",
+            "CANCELED",
+            "CANCELLED",
+            "REJECTED",
+            "EXPIRED",
+            "EXPIRED_IN_MATCH",
+        }
+        if not known_terminal:
+            state = "unknown"
+        elif executed_qty > 0:
+            full_qty = requested_qty is None or executed_qty + max(
+                1e-12, requested_qty * 1e-8
+            ) >= requested_qty
+            state = "filled" if exchange_status == "FILLED" and full_qty else "partial"
+        else:
+            state = "failed" if known_terminal else "unknown"
+        slippage = (
+            round((avg_price - ref_price) / ref_price, 6)
+            if ref_price > 0 and avg_price > 0
+            else None
+        )
+        detail = {
+            "order_id": str(final_detail.get("orderId") or order_id or "?"),
+            "client_order_id": client_order_id,
+            "exec_price": avg_price if avg_price > 0 else None,
+            "exec_qty": executed_qty,
+            "exec_quote_usd": executed_quote,
+            "requested_qty": requested_qty,
+            "ref_price": ref_price,
+            "slippage": slippage,
+            "submit_ts": round(submit_ts, 3),
+            "fill_ts": round(time.time(), 3) if executed_qty > 0 else None,
+            "latency_ms": round((time.time() - submit_ts) * 1000),
+            "order_status": exchange_status,
+            "status": state,
+        }
+        if state == "unknown":
+            detail["error"] = redact_secret_values(
+                query_error or submit_error or "order status is not terminal"
+            )
+        elif state == "partial":
+            detail["error"] = "market order did not confirm the requested base quantity"
+        elif state == "failed":
+            detail["error"] = redact_secret_values(
+                submit_error or f"order ended with {exchange_status}"
+            )
+        return state == "filled", detail
 
     def place_margin_order(
         self,
@@ -647,75 +777,35 @@ class BinanceSpotVenue:
         quantity_precision: int = 6,
         ref_price: float = 0.0,
         side_effect: str = "NO_SIDE_EFFECT",
+        client_order_id: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        """Cross margin market order.
+        """Margin orders are disabled; this executor never auto-borrows or repays."""
+        block_real_execution("margin order")
+        return False, {
+            "status": "failed",
+            "order_status": "NOT_SUBMITTED",
+            "exec_qty": 0.0,
+            "client_order_id": client_order_id,
+            "error": "margin orders are disabled; pre-funded spot/perpetual execution only",
+        }
 
-        side_effect:
-          - MARGIN_BUY : auto-borrow missing assets (SELL = borrow to sell)
-          - AUTO_REPAY : auto-repay debt after execution (BUY = buy back to repay)
-        """
-        client_oid = f"qmgn{int(time.time())}{random.randint(0, 9999)}"
-        qty = f"{amount_base:.{quantity_precision}f}".rstrip("0").rstrip(".")
-        if "." not in qty:
-            qty = f"{amount_base:.{quantity_precision}f}"
-        submit_ts = time.time()
-        try:
-            result = _api_call(
-                "POST",
-                "/sapi/v1/margin/order",
-                {
-                    "symbol": pair,
-                    "isIsolated": "FALSE",
-                    "side": side,
-                    "type": "MARKET",
-                    "quantity": qty,
-                    "sideEffectType": side_effect,
-                    "newClientOrderId": client_oid,
-                },
-                signed=True,
-            )
-            fill_ts = time.time()
-            latency_ms = round((fill_ts - submit_ts) * 1000)
-            order_id = str(result.get("orderId", "?"))
-            exec_qty = float(result.get("executedQty", 0))
-            exec_quote = float(result.get("cummulativeQuoteQty", 0))
-            exec_price = exec_quote / exec_qty if exec_qty > 0 else ref_price
-            slippage = (
-                round((exec_price - ref_price) / ref_price, 6)
-                if ref_price and exec_price
-                else None
-            )
-            return True, {
-                "order_id": order_id,
-                "exec_price": exec_price,
-                "exec_qty": exec_qty,
-                "exec_quote_usd": exec_quote,
-                "ref_price": ref_price,
-                "slippage": slippage,
-                "submit_ts": round(submit_ts, 3),
-                "fill_ts": round(fill_ts, 3),
-                "latency_ms": latency_ms,
-                "order_status": result.get("status", ""),
-            }
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode()
-            except Exception:
-                body = ""
-            return False, {"error": f"HTTP {e.code}: {body[:200]}"}
-        except Exception as e:
-            return False, {"error": str(e)}
-
-    def _fetch_order_detail(self, pair: str, order_id: str) -> dict[str, Any]:
-        try:
-            return _api_call(
-                "GET",
-                "/api/v3/order",
-                {"symbol": pair, "orderId": order_id},
-                signed=True,
-            )
-        except Exception:
-            return {}
+    def _fetch_order_detail(
+        self,
+        pair: str,
+        order_id: str | None = None,
+        *,
+        client_order_id: str | None = None,
+        category: str = "spot",
+    ) -> dict[str, Any]:
+        query_path, _ = self._order_paths(category)
+        params: dict[str, Any] = {"symbol": pair}
+        if order_id and order_id != "?":
+            params["orderId"] = order_id
+        elif client_order_id:
+            params["origClientOrderId"] = client_order_id
+        else:
+            raise ValueError("order_id or client_order_id is required")
+        return _api_call("GET", query_path, params, signed=True)
 
     def place_buy(
         self,
@@ -723,10 +813,14 @@ class BinanceSpotVenue:
         amount_usdt: float,
         quote_precision: int = 2,
         ref_price: float = 0.0,
+        client_order_id: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        client_oid = f"qbuy{int(time.time())}{random.randint(0, 9999)}"
+        block_real_execution("spot order")
+        client_oid = self._make_client_order_id(client_order_id, "qbuy")
         quote_qty = f"{amount_usdt:.{quote_precision}f}"
         submit_ts = time.time()
+        submit_error: Exception | None = None
+        order_id: str | None = None
         try:
             result = _api_call(
                 "POST",
@@ -737,43 +831,23 @@ class BinanceSpotVenue:
                     "type": "MARKET",
                     "quoteOrderQty": quote_qty,
                     "newClientOrderId": client_oid,
+                    "newOrderRespType": "RESULT",
                 },
                 signed=True,
             )
-            fill_ts = time.time()
-            latency_ms = round((fill_ts - submit_ts) * 1000)
-            order_id = str(result.get("orderId", "?"))
-            detail = self._fetch_order_detail(pair, order_id)
-            exec_qty = float(detail.get("executedQty", result.get("executedQty", 0)))
-            exec_quote = float(
-                detail.get("cummulativeQuoteQty", result.get("cummulativeQuoteQty", 0))
-            )
-            exec_price = exec_quote / exec_qty if exec_qty > 0 else ref_price
-            slippage = (
-                round((exec_price - ref_price) / ref_price, 6)
-                if ref_price and exec_price
-                else None
-            )
-            return True, {
-                "order_id": order_id,
-                "exec_price": exec_price,
-                "exec_qty": exec_qty,
-                "exec_quote_usd": exec_quote,
-                "ref_price": ref_price,
-                "slippage": slippage,
-                "submit_ts": round(submit_ts, 3),
-                "fill_ts": round(fill_ts, 3),
-                "latency_ms": latency_ms,
-                "order_status": detail.get("status", result.get("status", "")),
-            }
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode()
-            except Exception:
-                body = ""
-            return False, {"error": f"HTTP {e.code}: {body[:200]}"}
+            order_id = str(result.get("orderId") or "") or None
         except Exception as e:
-            return False, {"error": str(e)}
+            submit_error = e
+        return self._settle_market_order(
+            pair=pair,
+            category="spot",
+            client_order_id=client_oid,
+            order_id=order_id,
+            requested_qty=None,
+            ref_price=ref_price,
+            submit_ts=submit_ts,
+            submit_error=submit_error,
+        )
 
     def place_sell(
         self,
@@ -781,12 +855,16 @@ class BinanceSpotVenue:
         amount_base: float,
         quantity_precision: int = 6,
         ref_price: float = 0.0,
+        client_order_id: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        client_oid = f"qsell{int(time.time())}{random.randint(0, 9999)}"
+        block_real_execution("spot order")
+        client_oid = self._make_client_order_id(client_order_id, "qsell")
         qty = f"{amount_base:.{quantity_precision}f}".rstrip("0").rstrip(".")
         if "." not in qty:
             qty = f"{amount_base:.{quantity_precision}f}"
         submit_ts = time.time()
+        submit_error: Exception | None = None
+        order_id: str | None = None
         try:
             result = _api_call(
                 "POST",
@@ -797,43 +875,23 @@ class BinanceSpotVenue:
                     "type": "MARKET",
                     "quantity": qty,
                     "newClientOrderId": client_oid,
+                    "newOrderRespType": "RESULT",
                 },
                 signed=True,
             )
-            fill_ts = time.time()
-            latency_ms = round((fill_ts - submit_ts) * 1000)
-            order_id = str(result.get("orderId", "?"))
-            detail = self._fetch_order_detail(pair, order_id)
-            exec_qty = float(detail.get("executedQty", result.get("executedQty", 0)))
-            exec_quote = float(
-                detail.get("cummulativeQuoteQty", result.get("cummulativeQuoteQty", 0))
-            )
-            exec_price = exec_quote / exec_qty if exec_qty > 0 else ref_price
-            slippage = (
-                round((exec_price - ref_price) / ref_price, 6)
-                if ref_price and exec_price
-                else None
-            )
-            return True, {
-                "order_id": order_id,
-                "exec_price": exec_price,
-                "exec_qty": exec_qty,
-                "exec_quote_usd": exec_quote,
-                "ref_price": ref_price,
-                "slippage": slippage,
-                "submit_ts": round(submit_ts, 3),
-                "fill_ts": round(fill_ts, 3),
-                "latency_ms": latency_ms,
-                "order_status": detail.get("status", result.get("status", "")),
-            }
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode()
-            except Exception:
-                body = ""
-            return False, {"error": f"HTTP {e.code}: {body[:200]}"}
+            order_id = str(result.get("orderId") or "") or None
         except Exception as e:
-            return False, {"error": str(e)}
+            submit_error = e
+        return self._settle_market_order(
+            pair=pair,
+            category="spot",
+            client_order_id=client_oid,
+            order_id=order_id,
+            requested_qty=amount_base,
+            ref_price=ref_price,
+            submit_ts=submit_ts,
+            submit_error=submit_error,
+        )
 
     def place_futures_order(
         self,
@@ -843,8 +901,10 @@ class BinanceSpotVenue:
         quantity_precision: int = 3,
         ref_price: float = 0.0,
         reduce_only: bool = False,
+        client_order_id: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        client_oid = f"qfut{int(time.time())}{random.randint(0, 9999)}"
+        block_real_execution("futures order")
+        client_oid = self._make_client_order_id(client_order_id, "qfut")
         qty = f"{amount_base:.{quantity_precision}f}".rstrip("0").rstrip(".")
         if "." not in qty:
             qty = f"{amount_base:.{quantity_precision}f}"
@@ -861,7 +921,10 @@ class BinanceSpotVenue:
         }
         if reduce_only:
             params["reduceOnly"] = "true"
+        params["newOrderRespType"] = "RESULT"
 
+        submit_error: Exception | None = None
+        order_id: str | None = None
         try:
             result = _api_call(
                 "POST",
@@ -869,39 +932,19 @@ class BinanceSpotVenue:
                 params,
                 signed=True,
             )
-            fill_ts = time.time()
-            latency_ms = round((fill_ts - submit_ts) * 1000)
-            order_id = str(result.get("orderId", "?"))
-            exec_qty = float(result.get("executedQty", 0))
-            # fapi /order returns avgPrice; falls back to ref_price if absent
-            exec_price = float(result.get("avgPrice", 0)) or ref_price
-            exec_quote = exec_price * exec_qty
-
-            slippage = (
-                round((exec_price - ref_price) / ref_price, 6)
-                if ref_price and exec_price
-                else None
-            )
-            return True, {
-                "order_id": order_id,
-                "exec_price": exec_price,
-                "exec_qty": exec_qty,
-                "exec_quote_usd": exec_quote,
-                "ref_price": ref_price,
-                "slippage": slippage,
-                "submit_ts": round(submit_ts, 3),
-                "fill_ts": round(fill_ts, 3),
-                "latency_ms": latency_ms,
-                "order_status": result.get("status", ""),
-            }
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode()
-            except Exception:
-                body = ""
-            return False, {"error": f"HTTP {e.code}: {body[:200]}"}
+            order_id = str(result.get("orderId") or "") or None
         except Exception as e:
-            return False, {"error": str(e)}
+            submit_error = e
+        return self._settle_market_order(
+            pair=pair,
+            category="futures",
+            client_order_id=client_oid,
+            order_id=order_id,
+            requested_qty=amount_base,
+            ref_price=ref_price,
+            submit_ts=submit_ts,
+            submit_error=submit_error,
+        )
 
     def execute_trades(
         self,
@@ -909,6 +952,7 @@ class BinanceSpotVenue:
         market: dict[str, dict[str, Any]],
         dry_run: bool,
     ) -> list[dict[str, Any]]:
+        require_dry_run(dry_run, "Binance trade execution")
         results: list[dict[str, Any]] = []
         for trade in trades:
             symbol = trade["symbol"]
@@ -928,19 +972,13 @@ class BinanceSpotVenue:
                 continue
             is_margin = str(trade.get("account", "")).lower() == "margin"
             if trade["type"] in ("buy", "sell") and is_margin:
-                # Reverse C&C spot leg uses cross margin:
-                # sell + auto_borrow = borrow to sell; buy + auto_repay = buy back to auto-repay.
-                effect_map = {"auto_borrow": "MARGIN_BUY", "auto_repay": "AUTO_REPAY"}
-                side_effect = effect_map.get(
-                    str(trade.get("side_effect", "")).lower(), "NO_SIDE_EFFECT"
-                )
                 ok, detail = self.place_margin_order(
                     pair,
                     "BUY" if trade["type"] == "buy" else "SELL",
                     trade["amount_base"],
                     int(mkt.get("quantity_precision", 6)),
                     ref_price=ref_price,
-                    side_effect=side_effect,
+                    client_order_id=trade.get("client_order_id"),
                 )
             elif trade["type"] == "buy":
                 ok, detail = self.place_buy(
@@ -948,6 +986,7 @@ class BinanceSpotVenue:
                     trade["amount_usdt"],
                     int(mkt.get("quote_precision", 2)),
                     ref_price=ref_price,
+                    client_order_id=trade.get("client_order_id"),
                 )
             elif trade["type"] == "sell":
                 ok, detail = self.place_sell(
@@ -955,6 +994,7 @@ class BinanceSpotVenue:
                     trade["amount_base"],
                     int(mkt.get("quantity_precision", 6)),
                     ref_price=ref_price,
+                    client_order_id=trade.get("client_order_id"),
                 )
             elif trade["type"] in ("open_short", "close_long"):
                 # Perp sell (open short or close long)
@@ -967,6 +1007,7 @@ class BinanceSpotVenue:
                     int(trade.get("quantity_precision") or f_prec),
                     ref_price=ref_price,
                     reduce_only=(trade["type"] == "close_long"),
+                    client_order_id=trade.get("client_order_id"),
                 )
             elif trade["type"] in ("close_short", "open_long"):
                 # Perp buy (open long or close short)
@@ -979,27 +1020,20 @@ class BinanceSpotVenue:
                     int(trade.get("quantity_precision") or f_prec),
                     ref_price=ref_price,
                     reduce_only=(trade["type"] == "close_short"),
+                    client_order_id=trade.get("client_order_id"),
                 )
             else:
-                ok, detail = False, {"error": f"Unknown trade type {trade['type']}"}
-            record["status"] = "filled" if ok else "failed"
-            if ok:
-                record.update(
-                    {
-                        "order_id": detail.get("order_id"),
-                        "exec_price": detail.get("exec_price"),
-                        "exec_qty": detail.get("exec_qty"),
-                        "exec_quote_usd": detail.get("exec_quote_usd"),
-                        "slippage": detail.get("slippage"),
-                        "latency_ms": detail.get("latency_ms"),
-                        "submit_ts": detail.get("submit_ts"),
-                        "fill_ts": detail.get("fill_ts"),
-                        "order_status": detail.get("order_status"),
-                        "error": None,
-                    }
-                )
-            else:
-                record["order_id"] = None
-                record["error"] = detail.get("error", str(detail))
+                ok, detail = False, {
+                    "status": "failed",
+                    "order_status": "NOT_SUBMITTED",
+                    "exec_qty": 0.0,
+                    "error": f"Unknown trade type {trade['type']}",
+                }
+            record.update(detail)
+            record["status"] = str(
+                detail.get("status") or ("filled" if ok else "failed")
+            ).lower()
+            record.setdefault("order_id", None)
+            record.setdefault("error", None if ok else "order did not confirm full fill")
             results.append(record)
         return results

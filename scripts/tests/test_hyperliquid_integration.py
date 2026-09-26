@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import execution.pure_futures_executor as pure_futures_executor  # noqa: E402
+
 TMP = Path(tempfile.gettempdir()) / "funding-arb-test-hyperliquid"
 
 # ---------------------------------------------------------------------------
@@ -155,6 +157,43 @@ class FakeCexVenue:
                     "exec_price": self.price,
                 })
         return out
+
+
+class FakeStateJournal:
+    """Test-only journal double; it cannot verify or reconcile real orders."""
+
+    def __init__(self, ledger_path):
+        self.ledger_path = ledger_path
+
+    def has_unresolved_work(self):
+        return False
+
+    def blocking_reasons(self):
+        return []
+
+    def begin_operation(self, *args, **kwargs):
+        return None
+
+    def finish_operation(self, *args, **kwargs):
+        return None
+
+    def record_incident(self, *args, **kwargs):
+        return "fake-incident"
+
+
+def _enable_fake_state_machine(monkeypatch, *venues):
+    fake_types = (FakeCexVenue, FakeHyperliquidVenue)
+    if not venues or any(not isinstance(venue, fake_types) for venue in venues):
+        raise AssertionError("state-machine tests must inject only fake venues")
+
+    def submit_fake(venue, trade, market, **_kwargs):
+        if not isinstance(venue, fake_types):
+            raise AssertionError("fake journaled submit received a non-fake venue")
+        return venue.execute_trades([trade], market, dry_run=False)
+
+    monkeypatch.setattr(pure_futures_executor, "require_dry_run", lambda *_: None)
+    monkeypatch.setattr(pure_futures_executor, "execute_journaled_trade", submit_fake)
+    monkeypatch.setattr(pure_futures_executor, "SafeExecutionJournal", FakeStateJournal)
 
 
 # ===========================================================================
@@ -489,13 +528,16 @@ class TestExecutorWithHyperliquid:
         assert close_result.ok
         assert close_result.state == "simulated"
 
-    def test_live_open_short_leg_failure_rollback(self):
-        """If short leg (HL) fails, long leg (CEX) should be rolled back."""
+    def test_fake_transport_short_leg_failure_rolls_back_long(self, monkeypatch):
+        """Fake short-leg failure exercises state recovery without enabling live execution."""
         from execution.pure_futures_executor import open_pure_futures_pair
 
         path = _path("hl_rollback")
         lv = FakeCexVenue("binance", price=60000.0)
         sv = FakeHyperliquidVenue("hyperliquid", price=60100.0, fail_types={"open_short"})
+        # All venue transports and the journal are local fakes before the
+        # narrow module-local guard/transport stubs are installed.
+        _enable_fake_state_machine(monkeypatch, lv, sv)
 
         result = open_pure_futures_pair(
             "BTC",
@@ -511,13 +553,14 @@ class TestExecutorWithHyperliquid:
         assert not result.ok
         assert result.state == "rolled_back"
 
-    def test_live_open_long_leg_failure_aborts(self):
-        """If long leg (HL) fails, no short leg should be attempted."""
+    def test_fake_transport_long_leg_failure_aborts(self, monkeypatch):
+        """Fake long-leg failure exercises ordering without reaching a venue SDK."""
         from execution.pure_futures_executor import open_pure_futures_pair
 
         path = _path("hl_long_fail")
         lv = FakeHyperliquidVenue("hyperliquid", price=60000.0, fail_types={"open_long"})
         sv = FakeCexVenue("binance", price=60100.0)
+        _enable_fake_state_machine(monkeypatch, lv, sv)
 
         result = open_pure_futures_pair(
             "BTC",

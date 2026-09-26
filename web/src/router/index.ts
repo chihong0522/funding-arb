@@ -1,7 +1,7 @@
 import { createRouter, createWebHistory } from "vue-router";
 import Scanner from "@/views/Scanner.vue";
-// Other views are lazy-loaded to reduce initial bundle size
-// (ethers + @nktkas/hyperliquid only load when DEX page is visited)
+// Other views are lazy-loaded to reduce initial bundle size. The /dex route
+// redirects to supported CEX settings; browser-wallet order code is disabled.
 
 const routes = [
   {
@@ -30,9 +30,7 @@ const routes = [
   },
   {
     path: "/dex",
-    name: "DexConnection",
-    component: () => import("@/views/DexConnection.vue"),
-    meta: { titleKey: "menu.dex" },
+    redirect: "/cex",
   },
   {
     path: "/strategy",

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Unified credential provider — automatically selects the most secure backend available for the current platform.
 
-Backend priority (highest security first):
+Credential sources (highest security first):
   1. keyring       — macOS Keychain / Windows Credential Manager / Linux Secret Service
   2. systemd-creds — Linux machine-bound (TPM2 / machine-id), recommended for headless servers
   3. age           — encrypted files, protects against accidental exposure but not malicious same-user processes
-  4. credentials.json — plaintext JSON fallback
+
+Plaintext credentials.json files are never loaded.
 
 Usage (in venue modules):
   from core.credentials import ensure_env
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,7 +31,6 @@ _APP_DIR = Path.home() / ".funding-arb"
 _AGE_DIRS = [_APP_DIR]
 _SYSTEMD_CREDS_DIRS = [Path("/etc/funding-arb/creds")]
 _SERVICES = ["funding-arb"]
-_JSON_FILES = [_APP_DIR / "credentials.json"]
 
 _KNOWN_PREFIXES = (
     "BINANCE_",
@@ -38,7 +39,11 @@ _KNOWN_PREFIXES = (
     "OKX_",
     "HYPERLIQUID_",
     "EDGEX_",
+    "ASTER_",
+    "DYDX_",
+    "LIGHTER_",
     "TELEGRAM_",
+    "TRADE_SIGNER_",
 )
 
 _ALL_KEYS = [
@@ -59,6 +64,12 @@ _ALL_KEYS = [
     "HYPERLIQUID_API_SECRET",
     "EDGEX_ACCOUNT_ID",
     "EDGEX_TRADING_PRIVATE_KEY",
+    "ASTER_API_KEY",
+    "ASTER_API_SECRET",
+    "DYDX_MNEMONIC",
+    "LIGHTER_API_PRIVATE_KEY",
+    "HYPERLIQUID_PRIVATE_KEY",
+    "TRADE_SIGNER_API_TOKEN",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
 ]
@@ -144,29 +155,13 @@ def _load_age() -> dict[str, str]:
     return {}
 
 
-# Backend 4: JSON plaintext (fallback)
-def _load_json() -> dict[str, str]:
-    merged: dict[str, str] = {}
-    for path in _JSON_FILES:
-        try:
-            with open(path, encoding="utf-8") as f:
-                env = json.load(f).get("env", {})
-            merged.update({k: str(v) for k, v in env.items() if v})
-        except (OSError, json.JSONDecodeError):
-            pass
-    return merged
-
-
-# Unified loading (with cache, merges low-to-high security, higher overwrites lower)
+# Unified loading (merges secure backends, higher-priority sources overwrite lower)
 def _load_all() -> dict[str, str]:
     global _cache
     if _cache is not None:
         return _cache
 
     merged: dict[str, str] = {}
-
-    # Lowest: JSON plaintext
-    merged.update(_load_json())
 
     # Medium: age encrypted
     merged.update(_load_age())
@@ -202,12 +197,6 @@ def ensure_env(prefix: str = "") -> None:
 
     all_creds = _load_all()
 
-    # Supplement with keys that may exist in JSON but are not listed in _ALL_KEYS
-    json_env = _load_json()
-    for k in json_env:
-        if _is_known_key(k) and k not in all_creds:
-            all_creds[k] = json_env[k]
-
     for key, value in all_creds.items():
         if prefix and not key.startswith(prefix):
             continue
@@ -224,3 +213,17 @@ def get_credential(key: str) -> str | None:
     if val:
         return val
     return _load_all().get(key)
+
+
+def redact_secret_values(value: object) -> str:
+    """Redact configured credential values and common signed-request fields."""
+    text = str(value)
+    for key in _ALL_KEYS:
+        secret = os.environ.get(key)
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return re.sub(
+        r"(?i)(signature|api[_-]?key|secret|token|passphrase|mnemonic|private[_-]?key)([=: ]+)[^&\s,}'\"]+",
+        r"\1\2[REDACTED]",
+        text,
+    )

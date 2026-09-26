@@ -8,10 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import venues.lighter as lighter_mod
+from core.execution_policy import LiveExecutionDisabled
 from venues.lighter import LighterVenue, _base_from_pair, _pair_from_base
 
 _ORDER_BOOK_DETAILS = {
@@ -162,7 +165,7 @@ class TestExecution:
         assert results[0]["venue"] == "lighter"
         assert results[0]["exec_price"] == 60000.0
 
-    def test_direction_mapping_and_scaling(self):
+    def test_direction_mapping_and_scaling_with_fake_transport(self, monkeypatch):
         """open_long/close_short → bid; open_short/close_long → ask; ints scaled by decimals."""
         import venues.lighter_funding as lf
 
@@ -188,6 +191,9 @@ class TestExecution:
                     return None, SimpleNamespace(tx_hash="0xabc"), None
 
                 v._submit_market_order = fake_submit  # type: ignore[method-assign]
+                # Exercise pure order math only after installing the fake SDK
+                # submitter; no signer/network transport is reachable here.
+                monkeypatch.setattr(lighter_mod, "require_dry_run", lambda *_: None)
                 trades = [{"symbol": "BTC", "type": typ, "amount_base": 0.01}]
                 market = {"BTC": {"price": 60000.0}}
                 results = v.execute_trades(trades, market, dry_run=False)
@@ -202,7 +208,7 @@ class TestExecution:
                 bound = 60000.0 * (0.98 if is_ask else 1.02)
                 assert captured["price_scaled"] == int(round(bound * 10))
 
-    def test_sdk_error_marks_failed(self):
+    def test_fake_transport_error_marks_failed(self, monkeypatch):
         import venues.lighter_funding as lf
 
         with patch.object(lf, "http_get_json", return_value=_ORDER_BOOK_DETAILS):
@@ -212,6 +218,7 @@ class TestExecution:
                 return None, None, "nonce error"
 
             v._submit_market_order = fake_submit  # type: ignore[method-assign]
+            monkeypatch.setattr(lighter_mod, "require_dry_run", lambda *_: None)
             results = v.execute_trades(
                 [{"symbol": "BTC", "type": "open_long", "amount_base": 0.01}],
                 {"BTC": {"price": 60000.0}},
@@ -220,18 +227,24 @@ class TestExecution:
         assert results[0]["status"] == "failed"
         assert "nonce error" in results[0]["error"]
 
-    def test_unknown_market_fails(self):
+    def test_live_request_is_blocked_before_market_lookup(self, monkeypatch):
         import venues.lighter_funding as lf
 
+        lookups = []
+        monkeypatch.setattr(
+            lf.LighterFundingProvider,
+            "market_meta_for_base",
+            lambda self, *args, **kwargs: lookups.append(args),
+        )
         with patch.object(lf, "http_get_json", return_value=_ORDER_BOOK_DETAILS):
             v = _fresh_venue()
-            results = v.execute_trades(
-                [{"symbol": "NOPE", "type": "open_long", "amount_base": 1}],
-                {"NOPE": {"price": 1.0}},
-                dry_run=False,
-            )
-        assert results[0]["status"] == "failed"
-        assert "market not found" in results[0]["error"]
+            with pytest.raises(LiveExecutionDisabled):
+                v.execute_trades(
+                    [{"symbol": "NOPE", "type": "open_long", "amount_base": 1}],
+                    {"NOPE": {"price": 1.0}},
+                    dry_run=False,
+                )
+        assert lookups == []
 
 
 class TestRegistration:

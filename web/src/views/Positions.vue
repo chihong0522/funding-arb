@@ -12,6 +12,7 @@ import {
 } from '@vicons/ionicons5'
 import { getPositions, getResolvedFees, post, type PositionItem } from '@/composables/useApi'
 import { useI18n } from 'vue-i18n'
+import { SUPPORTED_CEX_UI_VENUES } from '@/constants/venueOrder'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -211,6 +212,14 @@ function feeEstimate(p: PositionItem): number | null {
   // Round trip = 2× (open + close), but we only have taker rates per side
   // Approximation: sum of taker rates for all legs × trade_usd × 2 (open + close)
   return tradeUsd * (totalPct / 100) * 2
+}
+
+function canClosePosition(p: PositionItem): boolean {
+  if (p.dry_run === true || p.close_info?.dry_run === true) return true
+  const venues = [p.long_venue, p.short_venue, p.futures_venue, p.spot_venue].filter(Boolean) as string[]
+  return venues.length > 0 && venues.every(
+    (venue) => (SUPPORTED_CEX_UI_VENUES as readonly string[]).includes(venue),
+  )
 }
 
 /** Annualized return based on PnL, trade size, and hold time */
@@ -522,7 +531,7 @@ const tableColumns = computed<DataTableColumns<PositionItem>>(() => [
       size: 'tiny',
       type: 'error',
       secondary: true,
-      disabled: row.status === 'closed',
+      disabled: row.status === 'closed' || !canClosePosition(row),
       onClick: () => showCloseConfirm(row),
     }, { default: () => t('positions.close') }),
   },
@@ -625,6 +634,10 @@ const closing = ref(false)
 const closeTarget = ref<PositionItem | null>(null)
 
 function showCloseConfirm(row: PositionItem) {
+  if (!canClosePosition(row)) {
+    message.error(t('positions.closeUnsupported'))
+    return
+  }
   closeTarget.value = row
   showCloseModal.value = true
 }
@@ -632,6 +645,11 @@ function showCloseConfirm(row: PositionItem) {
 async function confirmClose() {
   const row = closeTarget.value
   if (!row) return
+  if (!canClosePosition(row)) {
+    message.error(t('positions.closeUnsupported'))
+    showCloseModal.value = false
+    return
+  }
   closing.value = true
   try {
     await post(`/positions/${row.id}/close`, { reason: 'manual' })
@@ -714,7 +732,7 @@ onMounted(() => {
       <template #footer>
         <n-space justify="end">
           <n-button size="small" @click="showCloseModal = false">{{ t('positions.cancel') }}</n-button>
-          <n-button size="small" type="error" :loading="closing" @click="confirmClose">{{ t('positions.confirmCloseBtn') }}</n-button>
+          <n-button size="small" type="error" :loading="closing" :disabled="!closeTarget || !canClosePosition(closeTarget)" @click="confirmClose">{{ t('positions.confirmCloseBtn') }}</n-button>
         </n-space>
       </template>
     </n-modal>

@@ -13,16 +13,16 @@ import urllib.request
 from typing import Any, Optional
 
 from core.config import resolve_timeframes
+from core.credentials import ensure_env, redact_secret_values
+from core.execution_policy import block_real_execution, require_dry_run
 from venues.base import make_pair
 from venues.http_util import (
-    credentials_file,
     http_get_json,
     parse_kline_ohlcv,
     rules_for_price,
 )
 
 BASE = "https://api.bitget.com"
-CONFIG_PATH = credentials_file()
 _symbol_rules_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _futures_rules_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _spot_ticker_loaded_at: float = 0.0
@@ -37,16 +37,7 @@ def _ensure_env() -> None:
     global _env_loaded
     if _env_loaded:
         return
-    if os.environ.get("BITGET_API_KEY"):
-        _env_loaded = True
-        return
-    try:
-        with open(CONFIG_PATH) as f:
-            for k, v in json.load(f).get("env", {}).items():
-                if v and k not in os.environ:
-                    os.environ[k] = str(v)
-    except (OSError, json.JSONDecodeError):
-        pass
+    ensure_env("BITGET_")
     _env_loaded = True
 
 
@@ -79,6 +70,8 @@ def _sign(ts: str, method: str, path: str, body: str) -> str:
 def _api_call(
     method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None
 ) -> dict:
+    if method.upper() != "GET":
+        block_real_execution("Bitget REST write")
     from urllib.parse import urlencode
 
     # Credential validation: fail immediately on missing credentials; never send private requests with empty credentials (avoids silent failures / account-state misjudgment)
@@ -86,7 +79,7 @@ def _api_call(
     if not (key and secret and passp):
         raise RuntimeError(
             "Bitget API credentials missing: please set environment variables BITGET_API_KEY / BITGET_SECRET_KEY / "
-            "BITGET_PASSPHRASE, or configure them in ~/.funding-arb/credentials.json under env."
+            "BITGET_PASSPHRASE in an approved secure credential store."
         )
 
     p = "?" + urlencode(params) if params else ""
@@ -114,11 +107,11 @@ def _api_call(
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read().decode())
         except Exception as e:
-            last_err = e
+            last_err = RuntimeError(redact_secret_values(e))
             if method == "GET" and attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
                 continue
-            raise
+            raise last_err from None
     raise last_err if last_err else RuntimeError("bitget _api_call failed")
 
 
@@ -302,6 +295,7 @@ class BitgetSpotVenue:
         self, asset: str, amount: float, from_account: str, to_account: str
     ) -> bool:
         """Transfer between spot / USDT-M futures / cross margin on Bitget."""
+        block_real_execution("internal transfer")
         fromType = self._ACCOUNT_TYPES.get(from_account)
         toType = self._ACCOUNT_TYPES.get(to_account)
         if not fromType or not toType:
@@ -333,7 +327,7 @@ class BitgetSpotVenue:
                     spot_usdt = float(asset.get("available", "0"))
                     break
         except Exception as e:
-            print(f"fetch_usdt_account_balances spot error: {e}", file=sys.stderr)
+            print(f"fetch_usdt_account_balances spot error: {redact_secret_values(e)}", file=sys.stderr)
             raise e
 
         futures_usdt = 0.0
@@ -348,7 +342,7 @@ class BitgetSpotVenue:
                     futures_usdt = float(asset.get("available", "0"))
                     break
         except Exception as e:
-            print(f"fetch_usdt_account_balances futures error: {e}", file=sys.stderr)
+            print(f"fetch_usdt_account_balances futures error: {redact_secret_values(e)}", file=sys.stderr)
             raise e
 
         return {"spot": spot_usdt, "futures": futures_usdt}
@@ -423,7 +417,7 @@ class BitgetSpotVenue:
                     if str(asset.get("marginCoin", "")).upper() == "USDT":
                         balances["USDT"] += float(asset.get("balance", "0"))
             except Exception as e:
-                print(f"bitget fetch_futures_balances error: {e}", file=sys.stderr)
+                print(f"bitget fetch_futures_balances error: {redact_secret_values(e)}", file=sys.stderr)
 
         return balances
 
@@ -465,7 +459,7 @@ class BitgetSpotVenue:
                         "leverage": lev,
                     }
         except Exception as e:
-            print(f"fetch_live_state futures positions error: {e}", file=sys.stderr)
+            print(f"fetch_live_state futures positions error: {redact_secret_values(e)}", file=sys.stderr)
             raise e
 
         return {"balances": balances, "futures_positions": positions}
@@ -582,10 +576,11 @@ class BitgetSpotVenue:
                         item.get("interest", 0) or 0
                     )
         except Exception as e:
-            print(f"bitget fetch_margin_debt failed: {e}", file=sys.stderr)
+            print(f"bitget fetch_margin_debt failed: {redact_secret_values(e)}", file=sys.stderr)
         return debt
 
     def _margin_borrow_repay(self, asset: str, amount: float, op: str) -> bool:
+        block_real_execution("margin borrow/repay")
         path = f"/api/v2/margin/crossed/account/{op}"
         amt_key = "borrowAmount" if op == "borrow" else "repayAmount"
         try:
@@ -600,7 +595,7 @@ class BitgetSpotVenue:
             )
             return res.get("code") == "00000"
         except Exception as e:
-            print(f"bitget margin {op} {asset} failed: {e}", file=sys.stderr)
+            print(f"bitget margin {op} {asset} failed: {redact_secret_values(e)}", file=sys.stderr)
             return False
 
     def margin_borrow(self, asset: str, amount: float) -> bool:
@@ -644,13 +639,8 @@ class BitgetSpotVenue:
         ref_price: float = 0.0,
         side_effect: str = "",
     ) -> tuple[bool, dict[str, Any]]:
-        """Cross margin market order.
-
-        side_effect:
-          - auto_borrow → loanType=autoLoan : auto-borrow missing assets (SELL = borrow to sell)
-          - auto_repay  → loanType=autoRepay: auto-repay debt after execution (BUY = buy back to repay)
-        Market buy is measured in quote; converted via ref_price + 1% buffer then cleared by autoRepay.
-        """
+        """Margin order submission is disabled at the global execution boundary."""
+        block_real_execution("margin order")
         loan_type = {"auto_borrow": "autoLoan", "auto_repay": "autoRepay"}.get(
             side_effect.lower(), "normal"
         )
@@ -678,7 +668,7 @@ class BitgetSpotVenue:
             fill_ts = time.time()
             if result.get("code") != "00000":
                 return False, {
-                    "error": f"{result.get('code')}: {result.get('msg', 'unknown')}"
+                    "error": redact_secret_values(f"{result.get('code')}: {result.get('msg', 'unknown')}")
                 }
             order_id = str((result.get("data") or {}).get("orderId", "?"))
             time.sleep(0.3)
@@ -707,9 +697,9 @@ class BitgetSpotVenue:
                 body_txt = e.read().decode()
             except Exception:
                 body_txt = ""
-            return False, {"error": f"HTTP {e.code}: {body_txt[:200]}"}
+            return False, {"error": redact_secret_values(f"HTTP {e.code}: {body_txt[:200]}")}
         except Exception as e:
-            return False, {"error": str(e)}
+            return False, {"error": redact_secret_values(e)}
 
     def _fetch_order_detail(self, order_id: str) -> dict[str, Any]:
         try:
@@ -787,16 +777,16 @@ class BitgetSpotVenue:
                     "order_status": parsed["order_status"],
                 }
             return False, {
-                "error": f"{result.get('code')}: {result.get('msg', 'unknown')}"
+                "error": redact_secret_values(f"{result.get('code')}: {result.get('msg', 'unknown')}")
             }
         except urllib.error.HTTPError as e:
             try:
                 body = e.read().decode()
             except Exception:
                 body = ""
-            return False, {"error": f"HTTP {e.code}: {body[:200]}"}
+            return False, {"error": redact_secret_values(f"HTTP {e.code}: {body[:200]}")}
         except Exception as e:
-            return False, {"error": str(e)}
+            return False, {"error": redact_secret_values(e)}
 
     def place_sell(
         self,
@@ -846,16 +836,16 @@ class BitgetSpotVenue:
                     "order_status": parsed["order_status"],
                 }
             return False, {
-                "error": f"{result.get('code')}: {result.get('msg', 'unknown')}"
+                "error": redact_secret_values(f"{result.get('code')}: {result.get('msg', 'unknown')}")
             }
         except urllib.error.HTTPError as e:
             try:
                 body = e.read().decode()
             except Exception:
                 body = ""
-            return False, {"error": f"HTTP {e.code}: {body[:200]}"}
+            return False, {"error": redact_secret_values(f"HTTP {e.code}: {body[:200]}")}
         except Exception as e:
-            return False, {"error": str(e)}
+            return False, {"error": redact_secret_values(e)}
 
     def place_futures_order(
         self,
@@ -928,16 +918,16 @@ class BitgetSpotVenue:
                     "order_status": "filled",
                 }
             return False, {
-                "error": f"{result.get('code')}: {result.get('msg', 'unknown')}"
+                "error": redact_secret_values(f"{result.get('code')}: {result.get('msg', 'unknown')}")
             }
         except urllib.error.HTTPError as e:
             try:
                 body = e.read().decode()
             except Exception:
                 body = ""
-            return False, {"error": f"HTTP {e.code}: {body[:200]}"}
+            return False, {"error": redact_secret_values(f"HTTP {e.code}: {body[:200]}")}
         except Exception as e:
-            return False, {"error": str(e)}
+            return False, {"error": redact_secret_values(e)}
 
     def execute_trades(
         self,
@@ -945,6 +935,7 @@ class BitgetSpotVenue:
         market: dict[str, dict[str, Any]],
         dry_run: bool,
     ) -> list[dict[str, Any]]:
+        require_dry_run(dry_run, "Bitget order execution")
         results: list[dict[str, Any]] = []
         for trade in trades:
             symbol = trade["symbol"]

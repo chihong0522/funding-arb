@@ -7,10 +7,13 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import venues.aster as aster_mod
+from core.execution_policy import LiveExecutionDisabled
 from venues.aster import AsterVenue
 
 _EXCHANGE_INFO = {
@@ -122,7 +125,7 @@ class TestExecution:
         assert results[0]["venue"] == "aster"
         assert results[0]["exec_price"] == 60000.0
 
-    def test_direction_mapping(self):
+    def test_direction_mapping_with_fake_order_transport(self, monkeypatch):
         """open_long/close_short → BUY; open_short/close_long → SELL; reduce_only on closes."""
         expected = {
             "open_long": ("BUY", False),
@@ -140,34 +143,37 @@ class TestExecution:
                     return True, {"order_id": "1", "exec_price": 60000.0, "exec_qty": qty}
 
                 v.place_futures_order = fake_order  # type: ignore[method-assign]
+                # Exercise only the order-mapping algorithm with this fake
+                # submitter. The real gate is covered without patches elsewhere.
+                monkeypatch.setattr(aster_mod, "require_dry_run", lambda *_: None)
                 trades = [{"symbol": "BTC", "type": typ, "amount_base": 0.01}]
                 market = {"BTC": {"price": 60000.0, "pair": "BTCUSDT"}}
                 results = v.execute_trades(trades, market, dry_run=False)
                 assert results[0]["status"] == "filled", typ
                 assert calls == [("BTCUSDT", side, reduce_only)], typ
 
-    def test_unknown_trade_type(self):
+    def test_live_request_is_blocked_before_trade_validation_or_submission(self):
         v = AsterVenue()
-        results = v.execute_trades(
-            [{"symbol": "BTC", "type": "hodl", "amount_base": 1}],
-            {"BTC": {"price": 1.0}},
-            dry_run=False,
-        )
-        assert results[0]["status"] == "failed"
-        assert "Unknown trade type" in results[0]["error"]
+        submissions = []
+        v.place_futures_order = lambda *args, **kwargs: submissions.append(args)  # type: ignore[method-assign]
+        with pytest.raises(LiveExecutionDisabled):
+            v.execute_trades(
+                [{"symbol": "BTC", "type": "hodl", "amount_base": 1}],
+                {"BTC": {"price": 1.0}},
+                dry_run=False,
+            )
+        assert submissions == []
 
-    def test_live_requires_credentials(self):
-        """Signed calls must fail loudly when ASTER keys are absent."""
-        with patch.dict("os.environ", {}, clear=False):
-            import os
+    def test_live_order_is_blocked_before_credentials_or_http(self, monkeypatch):
+        import urllib.request
 
-            os.environ.pop("ASTER_API_KEY", None)
-            os.environ.pop("ASTER_API_SECRET", None)
-            try:
-                aster_mod._api_call("POST", "/fapi/v1/order", {}, signed=True)
-                raise AssertionError("expected RuntimeError")
-            except RuntimeError as e:
-                assert "credentials missing" in str(e)
+        monkeypatch.delenv("ASTER_API_KEY", raising=False)
+        monkeypatch.delenv("ASTER_API_SECRET", raising=False)
+        requests = []
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: requests.append(a))
+        with pytest.raises(LiveExecutionDisabled):
+            aster_mod._api_call("POST", "/fapi/v1/order", {}, signed=True)
+        assert requests == []
 
 
 class TestRegistration:

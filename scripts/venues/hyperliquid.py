@@ -23,6 +23,9 @@ from typing import Any
 
 import requests
 
+from core.credentials import redact_secret_values
+from core.execution_policy import block_real_execution, require_dry_run
+
 # ---------------------------------------------------------------------------
 # SDK imports — optional, only needed for live order execution
 # ---------------------------------------------------------------------------
@@ -388,6 +391,7 @@ class HyperliquidVenue:
     # ── setup (SDK) ───────────────────────────────────────────────────
 
     def initialize_futures_symbol(self, pair: str) -> None:
+        block_real_execution("Hyperliquid leverage configuration")
         coin = _coin_from_pair(pair)
         if coin in self._leverage_set:
             return
@@ -406,6 +410,7 @@ class HyperliquidVenue:
         market: dict[str, dict[str, Any]],
         dry_run: bool,
     ) -> list[dict[str, Any]]:
+        require_dry_run(dry_run, "Hyperliquid order execution")
         results: list[dict[str, Any]] = []
         for trade in trades:
             symbol = trade["symbol"]
@@ -486,7 +491,7 @@ class HyperliquidVenue:
             except Exception as e:
                 record["status"] = "failed"
                 record["order_id"] = None
-                record["error"] = str(e)
+                record["error"] = redact_secret_values(e)
 
             results.append(record)
         return results

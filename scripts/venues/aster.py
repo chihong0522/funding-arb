@@ -22,6 +22,8 @@ import urllib.error
 import urllib.parse
 from typing import Any, Optional
 
+from core.credentials import redact_secret_values
+from core.execution_policy import block_real_execution, require_dry_run
 from venues.http_util import http_get_json
 
 BASE = "https://fapi.asterdex.com"
@@ -42,6 +44,8 @@ def _api_call(
     method: str, path: str, params: Optional[dict] = None, signed: bool = False
 ) -> Any:
     """Binance-style fapi call. GET retried, POST not (avoid duplicate orders)."""
+    if method.upper() != "GET":
+        block_real_execution("Aster REST write")
     import json as _json
     import urllib.request
 
@@ -73,11 +77,11 @@ def _api_call(
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return _json.loads(resp.read().decode())
         except Exception as e:
-            last_err = e
+            last_err = RuntimeError(redact_secret_values(e))
             if method == "GET" and attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
                 continue
-            raise
+            raise last_err from None
     raise last_err if last_err else RuntimeError("aster _api_call failed")
 
 
@@ -207,6 +211,7 @@ class AsterVenue:
         ref_price: float = 0.0,
         reduce_only: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
+        block_real_execution("Aster futures order")
         client_oid = f"afut{int(time.time())}{random.randint(0, 9999)}"
         qty = f"{amount_base:.{quantity_precision}f}".rstrip("0").rstrip(".")
         if "." not in qty:
@@ -245,12 +250,12 @@ class AsterVenue:
             }
         except urllib.error.HTTPError as e:
             try:
-                body = e.read().decode()
+                body = redact_secret_values(e.read().decode())
             except Exception:
                 body = ""
-            return False, {"error": f"HTTP {e.code}: {body[:200]}"}
+            return False, {"error": redact_secret_values(f"HTTP {e.code}: {body[:200]}")}
         except Exception as e:
-            return False, {"error": str(e)}
+            return False, {"error": redact_secret_values(e)}
 
     def execute_trades(
         self,
@@ -264,6 +269,7 @@ class AsterVenue:
             open_long / close_short → BUY  (reduce_only on close)
             open_short / close_long → SELL (reduce_only on close)
         """
+        require_dry_run(dry_run, "Aster order execution")
         results: list[dict[str, Any]] = []
         for trade in trades:
             symbol = trade["symbol"]

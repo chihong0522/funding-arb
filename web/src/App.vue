@@ -25,12 +25,13 @@ import {
   DocumentTextOutline,
   PulseOutline,
   KeyOutline,
-  WalletOutline,
   ToggleOutline,
   CardOutline,
   LockClosedOutline,
 } from '@vicons/ionicons5'
 import { useWebSocket, type TradingMode } from '@/composables/useApi'
+import { apiFetch, subscribeApiToken } from '@/composables/apiAuth'
+import ApiAuthControl from '@/components/ApiAuthControl.vue'
 import { isDemoMode, useDemoSnapshot } from '@/composables/useDemoSnapshot'
 import DemoBanner from '@/components/DemoBanner.vue'
 import i18n, { setLocale, SUPPORTED_LOCALES, type SupportedLocale } from '@/i18n'
@@ -64,11 +65,6 @@ const menuOptions = computed<MenuOption[]>(() => [
     label: t('menu.cex'),
     key: '/cex',
     icon: () => h(NIcon, null, { default: () => h(KeyOutline) }),
-  },
-  {
-    label: t('menu.dex'),
-    key: '/dex',
-    icon: () => h(NIcon, null, { default: () => h(WalletOutline) }),
   },
   {
     label: t('menu.strategy'),
@@ -118,13 +114,20 @@ async function fetchTradingMode() {
     return
   }
   try {
-    const response = await fetch('/api/settings/trading-mode')
+    const response = await apiFetch('/api/settings/trading-mode')
+    if (!response.ok) return
     const json = await response.json()
     if (json.success) tradingMode.value = json.data
   } catch {
     // ignore
   }
 }
+
+const unsubscribeApiToken = isDemoMode
+  ? () => {}
+  : subscribeApiToken((token) => {
+      if (token) void fetchTradingMode()
+    })
 
 function handleMenuUpdate(key: string) {
   router.push(key)
@@ -144,6 +147,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   wsDisconnect()
+  unsubscribeApiToken()
   if (tradingModeTimer) {
     clearInterval(tradingModeTimer)
     tradingModeTimer = null
@@ -215,6 +219,7 @@ onUnmounted(() => {
               size="tiny"
               style="width: 120px"
             />
+            <ApiAuthControl v-if="!isDemoMode" />
             <n-badge :type="isDemoMode ? 'success' : (connected ? 'success' : 'error')" :dot="true" />
             <n-text depth="3" class="header-status">
               {{ isDemoMode ? t('app.demoLive') : (connected ? t('app.connected') : t('app.disconnected')) }}

@@ -110,10 +110,41 @@
                 </div>
               </template>
 
+              <template v-if="strategy === 'carry'">
+                <div class="filter-group filter-group-bordered">
+                  <n-text depth="3" class="filter-label">{{ t('scanner.carryNotional') }}</n-text>
+                  <n-input-number
+                    v-model:value="carryNotionalUsd"
+                    :min="MIN_CARRY_NOTIONAL_USD"
+                    :max="MAX_CARRY_NOTIONAL_USD"
+                    :step="10"
+                    :precision="2"
+                    size="small"
+                    class="carry-input"
+                  >
+                    <template #prefix>$</template>
+                  </n-input-number>
+                </div>
+                <div class="filter-group filter-group-bordered">
+                  <n-text depth="3" class="filter-label">{{ t('scanner.carryHorizon') }}</n-text>
+                  <n-input-number
+                    v-model:value="carryHorizonHours"
+                    :min="MIN_CARRY_HORIZON_HOURS"
+                    :max="MAX_CARRY_HORIZON_HOURS"
+                    :step="1"
+                    :precision="0"
+                    size="small"
+                    class="carry-input"
+                  >
+                    <template #suffix>h</template>
+                  </n-input-number>
+                </div>
+              </template>
+
               <div class="filter-group actions-inline">
                 <n-tag v-if="refreshing" size="small" type="info" :bordered="false" class="status-tag">{{ t('scanner.scanningFromExchanges') }}</n-tag>
                 <n-tag v-else-if="lastScanLabel" size="small" type="success" :bordered="false" class="status-tag">{{ lastScanLabel }}</n-tag>
-                <n-button size="small" type="primary" ghost @click="handleTriggerScan" :loading="refreshing" class="action-btn">
+                <n-button size="small" type="primary" ghost @click="handleTriggerScan" :loading="refreshing" :disabled="!isDemoMode && !hasApiToken" class="action-btn">
                   <template #icon><n-icon size="14"><SearchOutline /></n-icon></template>
                   {{ t('scanner.scanNow') }}
                 </n-button>
@@ -122,6 +153,10 @@
           </div>
         </div>
       </template>
+
+      <n-alert v-if="!isDemoMode && !hasApiToken" type="warning" :bordered="false" style="margin-bottom: 12px">
+        {{ t('scanner.authRequired') }}
+      </n-alert>
 
       <n-spin :show="loading || refreshing">
         <!-- PURE FUTURES -->
@@ -151,6 +186,9 @@
             {{ t('scanner.scanOnlyStrategy') }}
             <router-link to="/docs/cash-and-carry" class="docs-link">{{ t('scanner.strategyDocsLink') }}</router-link>
           </n-alert>
+          <n-alert v-if="carryVenues.length > 0 && carryRequiresRescan" type="warning" :bordered="false" style="margin-bottom: 12px">
+            {{ t('scanner.carryRescanRequired') }}
+          </n-alert>
           <n-grid :cols="4" :x-gap="16" :y-gap="16" style="margin-bottom:16px">
             <n-gi v-for="(card, i) in carryStatCards" :key="i">
               <n-card size="small">
@@ -170,12 +208,23 @@
           <div v-for="ven in carryVenues" :key="ven.venue" style="margin-bottom:12px">
             <n-card :title="ven.venue.toUpperCase()" size="small">
               <template #header-extra>
-                <n-tag size="small" :bordered="false">{{ ven.total_pairs }} {{ t('scanner.pairs') }}</n-tag>
+                <n-space size="small" align="center">
+                  <n-tag size="small" :bordered="false">{{ ven.total_pairs }} {{ t('scanner.pairs') }}</n-tag>
+                  <n-tag size="small" type="info" :bordered="false">
+                    {{ formatUsd(ven.notional_usd) }} · {{ ven.horizon_hours ?? '—' }}h
+                  </n-tag>
+                  <n-tag size="small" :bordered="false">
+                    {{ formatTimestamp(ven.timestamp_ms) }}
+                  </n-tag>
+                </n-space>
               </template>
+              <n-text v-if="ven.disclaimer" depth="3" style="display:block;font-size:12px;margin-bottom:8px">
+                {{ ven.disclaimer }}
+              </n-text>
               <n-data-table
                 :columns="carryColumns"
                 :data="carryRowsForVenue(ven)"
-                :bordered="false" :scroll-x="580" size="small" striped
+                :bordered="false" :scroll-x="1740" size="small" striped
               />
             </n-card>
           </div>
@@ -208,39 +257,25 @@
       </n-spin>
     </n-card>
 
-    <n-modal v-model:show="showOpenModal" preset="card" :title="t('scanner.openPosition')" style="width: 460px">
+    <n-modal v-model:show="showOpenModal" preset="card" :title="t('scanner.openPosition')" style="width: 560px;max-width:calc(100vw - 32px)">
       <n-form label-placement="left" label-width="110" size="small">
         <n-form-item :label="t('scanner.pair')">
           <n-text strong>{{ openModalSummary }}</n-text>
         </n-form-item>
-        <n-form-item :label="t('scanner.amountUsdt')">
-          <n-input-number v-model:value="openAmount" :min="10" :step="100" style="width: 100%" />
+        <n-form-item :label="t('scanner.scannedNotional')">
+          <n-text strong>{{ openScannedNotional }}</n-text>
         </n-form-item>
 
-        <!-- Execution mode selector (only for pure futures with wallet-capable venues) -->
-        <n-form-item v-if="walletCapableVenues.length > 0" :label="t('scanner.openMode')">
-          <n-radio-group v-model:value="openMode" size="small">
-            <n-radio value="backend">{{ t('scanner.openModeBackend') }}</n-radio>
-            <n-radio value="wallet" :disabled="!walletModeAvailable">{{ t('scanner.openModeWallet') }}</n-radio>
-          </n-radio-group>
+        <n-form-item :label="t('scanner.executionMode')">
+          <n-tag size="small" type="info" :bordered="false">{{ t('scanner.paperOnly') }}</n-tag>
         </n-form-item>
-
-        <!-- Wallet leg status -->
-        <n-form-item v-if="openMode === 'wallet'" :label="' '" >
-          <n-space vertical :size="4" style="width: 100%">
-            <n-text v-for="leg in walletLegStatus" :key="leg.venue" depth="3" style="font-size: 12px">
-              <n-tag size="tiny" :type="leg.connected ? 'success' : 'warning'" :bordered="false">
-                {{ leg.venue }}
-              </n-tag>
-              {{ leg.connected ? t('scanner.walletLegReady') : t('scanner.walletLegNeedsKeys') }}
-            </n-text>
-          </n-space>
-        </n-form-item>
-
-        <n-form-item v-if="openMode === 'backend'" :label="t('scanner.dryRun')">
-          <n-switch v-model:value="openDryRun" />
-          <n-text v-if="!openDryRun" type="error" style="margin-left: 12px; font-size: 12px">{{ t('scanner.realOrdersWarning') }}</n-text>
-        </n-form-item>
+        <n-alert type="info" :bordered="false" style="margin-top: 8px">
+          {{ t('scanner.paperOnlyWarning') }}
+        </n-alert>
+        <n-alert v-if="openTarget?.kind === 'carry'" type="warning" :bordered="false" style="margin-top: 8px">
+          {{ t('scanner.illustrativeCapitalRoi') }}: {{ t('scanner.capitalRoiAssumption', { capital: openCapitalRequired }) }}
+          <br />{{ t('scanner.paperSnapshotOneUse') }}
+        </n-alert>
 
         <n-alert
           v-if="openTarget?.kind === 'pure' && openTarget.row.basis_risk_level !== 'clean'"
@@ -260,11 +295,8 @@
       <template #footer>
         <n-space justify="end">
           <n-button size="small" @click="showOpenModal = false">{{ t('scanner.cancel') }}</n-button>
-          <n-button v-if="openMode === 'wallet'" size="small" type="info" :loading="opening" @click="confirmOpen">
-            {{ t('scanner.walletSignOpen') }}
-          </n-button>
-          <n-button v-else size="small" :type="openDryRun ? 'primary' : 'error'" :loading="opening" @click="confirmOpen">
-            {{ openDryRun ? t('scanner.openDryRun') : t('scanner.openLive') }}
+          <n-button size="small" type="primary" :loading="opening" @click="confirmOpen">
+            {{ t('scanner.openDryRun') }}
           </n-button>
         </n-space>
       </template>
@@ -274,25 +306,14 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, h, watch } from 'vue'
-import { NCard, NGrid, NGi, NDataTable, NButton, NSpace, NText, NIcon, NSpin, NTag, NEmpty, NInputNumber, NModal, NForm, NFormItem, NSwitch, NSelect, NTooltip, NTabs, NTab, NAlert, NRadioGroup, NRadio, useMessage, type DataTableColumns, type SelectOption, type SelectGroupOption } from 'naive-ui'
+import { NCard, NGrid, NGi, NDataTable, NButton, NSpace, NText, NIcon, NSpin, NTag, NEmpty, NInputNumber, NModal, NForm, NFormItem, NSelect, NTooltip, NTabs, NTab, NAlert, useMessage, type DataTableColumns, type SelectOption, type SelectGroupOption } from 'naive-ui'
 import { RouterLink, useRoute } from 'vue-router'
 import { SearchOutline, TrendingUpOutline, FlashOutline, AnalyticsOutline } from '@vicons/ionicons5'
-import { post, useWebSocket, type ScannerOpportunities, type CarryVenue, type CarryCand, type UnifiedCarryCand, type WsMessage } from '@/composables/useApi'
+import { openCarryPaperPosition, useWebSocket, type ScannerOpportunities, type CarryVenue, type CarryCand, type UnifiedCarryCand, type WsMessage } from '@/composables/useApi'
+import { apiFetch, getApiToken, subscribeApiToken } from '@/composables/apiAuth'
 import { isDemoMode, useDemoSnapshot } from '@/composables/useDemoSnapshot'
-import { WALLET_TRADE_VENUES } from '@/constants/walletTrade'
-import { useWallet } from '@/composables/wallet'
 import { useI18n } from 'vue-i18n'
-import { CEX_VENUE_RANK, DEX_VENUE_RANK } from '@/constants/venueOrder'
-
-// Lazy-loaded wallet trade module — avoids pulling ethers + @nktkas/hyperliquid
-// into the initial bundle (Scanner is eagerly loaded on the / route).
-let _walletTradeModule: typeof import('@/composables/wallet/useWalletTrade') | null = null
-async function getWalletTrade() {
-  if (!_walletTradeModule) {
-    _walletTradeModule = await import('@/composables/wallet/useWalletTrade')
-  }
-  return _walletTradeModule
-}
+import { CEX_VENUE_RANK, DEX_VENUE_RANK, SUPPORTED_CEX_UI_VENUES } from '@/constants/venueOrder'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -342,6 +363,33 @@ const lastScanLabel = ref('')
 const pureData = ref<ScannerOpportunities | null>(null)
 const carryData = ref<CarryVenue[]>([])
 const unifiedData = ref<UnifiedCarryCand[]>([])
+
+const MIN_CARRY_NOTIONAL_USD = 10
+const MAX_CARRY_NOTIONAL_USD = 500
+const MIN_CARRY_HORIZON_HOURS = 1
+const MAX_CARRY_HORIZON_HOURS = 720
+const MAX_CARRY_SNAPSHOT_AGE_MS = 60_000
+const MAX_CARRY_BOOK_AGE_MS = 60_000
+const MAX_CARRY_BOOK_SKEW_MS = 10_000
+const MAX_CARRY_SOURCE_SKEW_MS = 60_000
+const MAX_CARRY_FUTURE_SKEW_MS = 30_000
+const MAX_CARRY_INSTRUMENT_AGE_MS = 3_600_000
+const MIN_CARRY_HISTORY_SAMPLES = 3
+const MAX_CARRY_HISTORY_GAP_INTERVALS = 1.5
+const carryNotionalUsd = ref<number | null>(100)
+const carryHorizonHours = ref<number | null>(24)
+const carryScanInputsValid = computed(() =>
+  Number.isFinite(carryNotionalUsd.value)
+  && carryNotionalUsd.value !== null
+  && carryNotionalUsd.value >= MIN_CARRY_NOTIONAL_USD
+  && carryNotionalUsd.value <= MAX_CARRY_NOTIONAL_USD
+  && Number.isFinite(carryHorizonHours.value)
+  && carryHorizonHours.value !== null
+  && carryHorizonHours.value >= MIN_CARRY_HORIZON_HOURS
+  && carryHorizonHours.value <= MAX_CARRY_HORIZON_HOURS,
+)
+const hasApiToken = ref(Boolean(getApiToken()))
+const currentTimeMs = ref(Date.now())
 
 const minEdgeFilter = ref<number>(0)
 const intervalFilter = ref<'all' | 'same' | 'cross'>('all')
@@ -433,6 +481,33 @@ function renderVenueTag({ option, handleClose }: { option: SelectOption; handleC
   ])
 }
 
+function closeEnough(value: unknown, expected: unknown): boolean {
+  return typeof value === 'number'
+    && typeof expected === 'number'
+    && Number.isFinite(value)
+    && Number.isFinite(expected)
+    && Math.abs(value - expected) <= Math.max(1e-7, Math.abs(expected) * 1e-9)
+}
+
+function carryDataMatchesInputs(data: unknown, notionalUsd: number, horizonHours: number): boolean {
+  if (!Array.isArray(data) || data.length === 0) return false
+  return data.every((venue) => {
+    const row = venue as CarryVenue
+    return typeof row?.venue === 'string'
+      && !row.error
+      && closeEnough(row.notional_usd, notionalUsd)
+      && closeEnough(row.horizon_hours, horizonHours)
+  })
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function positiveNumber(value: unknown): number | null {
+  return isFiniteNumber(value) && value > 0 ? value : null
+}
+
 async function loadStrategyVenues() {
   // Demo mode: no backend to ask — seed from the snapshot's venue list so the
   // venue filter and pure-futures default selection match what was scanned.
@@ -444,8 +519,9 @@ async function loadStrategyVenues() {
     }
     return
   }
+  if (!getApiToken()) return
   try {
-    const resp = await fetch('/api/settings/strategy')
+    const resp = await apiFetch('/api/settings/strategy')
     const json = await resp.json()
     const venues = json.data?.scan_venues
     if (Array.isArray(venues) && venues.length > 0) {
@@ -549,8 +625,12 @@ async function loadVenueCapabilities() {
     venueCaps.value = caps
     return
   }
+  if (!getApiToken()) {
+    venueCaps.value = {}
+    return
+  }
   try {
-    const resp = await fetch('/api/settings/venues')
+    const resp = await apiFetch('/api/settings/venues')
     const json = await resp.json()
     if (json.success && Array.isArray(json.data)) {
       const caps: Record<string, { trade: boolean; reason: string }> = {}
@@ -560,14 +640,6 @@ async function loadVenueCapabilities() {
       venueCaps.value = caps
     }
   } catch { /* ignore */ }
-}
-
-function rowTradeBlock(row: PureRow): string {
-  for (const vid of [row.long_venue, row.short_venue]) {
-    const cap = venueCaps.value[vid]
-    if (cap && !cap.trade) return `${vid}: scan-only${cap.reason ? ` (${cap.reason})` : ''}`
-  }
-  return ''
 }
 
 function venuesQuery(st?: Strategy): string {
@@ -608,7 +680,7 @@ async function refreshScanLabel(st: Strategy) {
     return
   }
   try {
-    const resp = await fetch(`/api/scanner/status?strategy=${st}`)
+    const resp = await apiFetch(`/api/scanner/status?strategy=${st}`)
     const json = await resp.json()
     lastScanLabel.value = formatScanTime(json.data?.last_scan_time)
   } catch {
@@ -653,21 +725,31 @@ async function loadDemoData(st: Strategy) {
   await refreshScanLabel(st)
 }
 
-async function waitForScanData(st: Strategy, maxMs = 120000) {
+async function waitForScanData(
+  st: Strategy,
+  maxMs = 120000,
+  expectedCarryInputs?: { notionalUsd: number; horizonHours: number },
+) {
   const start = Date.now()
   const vq = venuesQuery(st)
   while (Date.now() - start < maxMs) {
     await new Promise((r) => setTimeout(r, 2000))
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/scanner/opportunities?strategy=${st}&venues=${encodeURIComponent(vq)}`,
     )
     const json = await resp.json()
-    if (json.success && json.has_data) {
+    const carryMatches = st !== 'carry'
+      || (!!expectedCarryInputs && carryDataMatchesInputs(
+        json.data,
+        expectedCarryInputs.notionalUsd,
+        expectedCarryInputs.horizonHours,
+      ))
+    if (json.success && json.has_data && carryMatches) {
       applyScanData(st, json.data)
       await refreshScanLabel(st)
       return true
     }
-    const status = await fetch(`/api/scanner/status?strategy=${st}`).then((r) => r.json())
+    const status = await apiFetch(`/api/scanner/status?strategy=${st}`).then((r) => r.json())
     if (!status.data?.scanning) break
   }
   return false
@@ -675,6 +757,7 @@ async function waitForScanData(st: Strategy, maxMs = 120000) {
 
 async function loadData(s?: Strategy | MouseEvent, autoScan = true) {
   const st = (s && typeof s !== 'object') ? s : strategy.value
+  if (!isDemoMode && !getApiToken()) return
   loading.value = true
   try {
     // ─── Demo mode: read from the static snapshot, skip the backend entirely.
@@ -685,33 +768,48 @@ async function loadData(s?: Strategy | MouseEvent, autoScan = true) {
       return
     }
     const vq = venuesQuery(st)
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/scanner/opportunities?strategy=${st}&venues=${encodeURIComponent(vq)}`,
     )
     const json = await resp.json()
     const available = json.live ?? false
     const hasData = json.has_data ?? false
+    const expectedCarryInputs = st === 'carry' && carryScanInputsValid.value
+      ? {
+          notionalUsd: Number(carryNotionalUsd.value),
+          horizonHours: Number(carryHorizonHours.value),
+        }
+      : undefined
+    const carryMatches = st !== 'carry'
+      || (!!expectedCarryInputs && carryDataMatchesInputs(
+        json.data,
+        expectedCarryInputs.notionalUsd,
+        expectedCarryInputs.horizonHours,
+      ))
     if (!available) {
       message.warning(t('scanner.scannerUnavailable'))
       return
     }
     if (json.success && hasData && !json.venues_mismatch) {
+      // A size/horizon mismatch is still shown with an explicit stale warning,
+      // but the paper-open gate below refuses to use those economics.
       applyScanData(st, json.data)
       await refreshScanLabel(st)
     } else if (json.venues_mismatch) {
-      // Cached scan was for different venues — don't show stale rows
+      // Cached scan was for different venues — don't show those rows.
       if (st === 'pure') pureData.value = null
       else if (st === 'carry') carryData.value = []
       else unifiedData.value = []
       lastScannedVenues.value = []
     }
-    if (autoScan && (!hasData || json.venues_mismatch) && !refreshing.value) {
+    const needsScan = !hasData || json.venues_mismatch || !carryMatches
+    if (autoScan && needsScan && !refreshing.value) {
       if (st === 'pure' && scanVenuesForStrategy(st).length < 2) return
-      const status = await fetch(`/api/scanner/status?strategy=${st}`).then((r) => r.json())
+      const status = await apiFetch(`/api/scanner/status?strategy=${st}`).then((r) => r.json())
       if (status.data?.scanning) {
         refreshing.value = true
         try {
-          const ok = await waitForScanData(st)
+          const ok = await waitForScanData(st, 120000, expectedCarryInputs)
           if (!ok) message.warning(t('scanner.scanFailed'))
         } finally {
           refreshing.value = false
@@ -726,6 +824,20 @@ async function loadData(s?: Strategy | MouseEvent, autoScan = true) {
 
 async function handleTriggerScan() {
   const st = strategy.value
+  if (!isDemoMode && !getApiToken()) {
+    message.warning(t('scanner.authRequired'))
+    return
+  }
+  if (st === 'carry' && !carryScanInputsValid.value) {
+    message.warning(t('scanner.carryInvalidInputs'))
+    return
+  }
+  const expectedCarryInputs = st === 'carry'
+    ? {
+        notionalUsd: Number(carryNotionalUsd.value),
+        horizonHours: Number(carryHorizonHours.value),
+      }
+    : undefined
   // Demo mode: there's no backend to trigger — just re-fetch the snapshot
   // (forces a fresh snapshot fetch) and re-apply. Gives the user a sense that
   // the "Scan Now" button does something in the live demo.
@@ -749,17 +861,31 @@ async function handleTriggerScan() {
   refreshing.value = true
   try {
     const vq = venuesQuery(st)
-    const url = `/api/scanner/trigger?strategy=${st}&venues=${encodeURIComponent(vq)}`
-    const resp = await fetch(url, { method: 'POST' })
+    const params = new URLSearchParams({
+      strategy: st,
+      venues: vq,
+      ...(st === 'carry' ? {
+        notional_usd: String(carryNotionalUsd.value),
+        horizon_hours: String(carryHorizonHours.value),
+      } : {}),
+    })
+    const url = `/api/scanner/trigger?${params.toString()}`
+    const resp = await apiFetch(url, { method: 'POST' })
     const json = await resp.json()
     if (json.success) {
       applyScanData(st, json.data)
       await refreshScanLabel(st)
-      message.success(t('scanner.scanComplete'))
+      const resultMatches = st !== 'carry' || (!!expectedCarryInputs && carryDataMatchesInputs(
+        json.data,
+        expectedCarryInputs.notionalUsd,
+        expectedCarryInputs.horizonHours,
+      ))
+      if (resultMatches) message.success(t('scanner.scanComplete'))
+      else message.warning(t('scanner.carryRescanRequired'))
     } else if (json.error === 'Scan already in progress') {
-      const ok = await waitForScanData(st)
+      const ok = await waitForScanData(st, 120000, expectedCarryInputs)
       if (ok) message.success(t('scanner.scanComplete'))
-      else message.warning(t('scanner.scanFailed'))
+      else message.warning(st === 'carry' ? t('scanner.carryRescanRequired') : t('scanner.scanFailed'))
     } else {
       message.error(json.error || t('scanner.scanFailed'))
     }
@@ -834,38 +960,6 @@ type OpenTarget =
 const showOpenModal = ref(false)
 const opening = ref(false)
 const openTarget = ref<OpenTarget | null>(null)
-const openAmount = ref<number>(1000)
-const openDryRun = ref(true)
-const openMode = ref<'backend' | 'wallet'>('backend')
-
-// Synchronous wallet connection check — uses useWallet (no ethers import).
-const { hasKeplr, hasMetaMask, keplrState, metamaskState } = useWallet()
-
-// Fetch current mark price from backend scanner cache for size estimation.
-async function fetchBasePrice(base: string): Promise<number> {
-  try {
-    const resp = await fetch('/api/scanner/opportunities?strategy=pure')
-    const json = await resp.json()
-    if (json.success && json.data) {
-      const rows = [...(json.data.forward || []), ...(json.data.reverse || [])]
-      const row = rows.find((r: any) => r.base === base)
-      if (row) {
-        const lm = row.long_mark || 0
-        const sm = row.short_mark || 0
-        if (lm > 0 && sm > 0) return (lm + sm) / 2
-        if (lm > 0) return lm
-        if (sm > 0) return sm
-      }
-    }
-  } catch { /* ignore */ }
-  return 0
-}
-
-function isWalletConnected(venue: string): boolean {
-  if (venue === 'hyperliquid') return hasMetaMask.value && metamaskState.connected
-  if (venue === 'dydx') return hasKeplr.value && keplrState.connected
-  return false
-}
 
 const openModalSummary = computed(() => {
   const tgt = openTarget.value
@@ -882,88 +976,245 @@ const openModalSummary = computed(() => {
   return `${r.base}/USDT — ${r.direction} fut@${r.futures_venue} spot@${r.spot_venue}`
 })
 
-function showOpenDialog(target: OpenTarget) {
-  openTarget.value = target
-  openMode.value = 'backend'
-  showOpenModal.value = true
-}
-
-/** Which venues in the current target support wallet signing? */
-const walletCapableVenues = computed<string[]>(() => {
-  const tgt = openTarget.value
-  if (!tgt) return []
-  if (tgt.kind === 'pure') return [tgt.row.long_venue, tgt.row.short_venue].filter(v => (WALLET_TRADE_VENUES as readonly string[]).includes(v))
-  if (tgt.kind === 'carry') return []
-  const r = tgt.row
-  return [r.futures_venue, r.spot_venue].filter(v => v && (WALLET_TRADE_VENUES as readonly string[]).includes(v))
-})
-
-/** Can we use wallet mode for this pair? */
-const walletModeAvailable = computed(() => walletCapableVenues.value.length > 0 && walletCapableVenues.value.some(v => isWalletConnected(v)))
-
-/** Status per wallet-capable venue in this pair */
-const walletLegStatus = computed(() => {
-  return walletCapableVenues.value.map(v => ({
-    venue: v,
-    connected: isWalletConnected(v),
-  }))
-})
+const openScannedNotional = computed(() =>
+  openTarget.value?.kind === 'carry'
+    ? formatUsd(openTarget.value.row.notional_usd_requested)
+    : '—',
+)
+const openCapitalRequired = computed(() =>
+  openTarget.value?.kind === 'carry'
+    ? formatUsd(openTarget.value.row.capital_required_usd)
+    : '—',
+)
 
 function venueTradeBlock(...venueIds: string[]): string {
   for (const vid of venueIds) {
     const cap = venueCaps.value[vid]
-    if (cap && !cap.trade) return `${vid}: scan-only${cap.reason ? ` (${cap.reason})` : ''}`
+    if (!cap) return `${vid}: venue trading capability is unavailable`
+    if (!cap.trade) return `${vid}: scan-only${cap.reason ? ` (${cap.reason})` : ''}`
   }
   return ''
 }
 
+function carryCandidateIdentity(row: CarryCand, venue: string): string {
+  const symbol = row.symbol || `${row.base}USDT`
+  const snapshotIds = [
+    row.snapshot_id,
+    row.spot_book_snapshot_id,
+    row.perp_book_snapshot_id,
+    row.spot_instrument_snapshot_id,
+    row.perp_instrument_snapshot_id,
+  ].map((id) => id == null ? '' : String(id)).join(':')
+  return `${venue}:${symbol}:${row.snapshot_ts_ms ?? 'missing-time'}:${snapshotIds}`
+}
+
+function snapshotIdentity(row: CarryRow): string {
+  const ids: Array<readonly [string, string | number | null | undefined]> = [
+    ['candidate', row.snapshot_id],
+    ['spot book', row.spot_book_snapshot_id],
+    ['perp book', row.perp_book_snapshot_id],
+    ['spot instrument', row.spot_instrument_snapshot_id],
+    ['perp instrument', row.perp_instrument_snapshot_id],
+  ]
+  const availableIds = ids.filter(([, id]) => id !== null && id !== undefined && id !== '')
+  if (availableIds.length > 0) return availableIds.map(([label, id]) => `${label}=${String(id)}`).join(' · ')
+  return `${row._venue}:${row.symbol || `${row.base}USDT`}:${row.snapshot_ts_ms ?? '—'}`
+}
+
+function carryCandidateBlock(row: CarryRow): string {
+  if (!carryScanInputsValid.value) return t('scanner.carryInvalidInputs')
+  const venue = carryData.value.find((item) => item.venue === row._venue)
+  if (!venue || !carryDataMatchesInputs(
+    carryData.value,
+    Number(carryNotionalUsd.value),
+    Number(carryHorizonHours.value),
+  )) return t('scanner.carryRescanRequired')
+  if (row._direction !== 'forward' || row.direction !== 'forward') {
+    return t('scanner.paperCarryOnly')
+  }
+  if (row.venue !== row._venue || row.symbol !== `${row.base}USDT`) {
+    return t('scanner.carryCandidateMismatch')
+  }
+  if (!closeEnough(venue.notional_usd, Number(carryNotionalUsd.value))
+    || !closeEnough(venue.horizon_hours, Number(carryHorizonHours.value))
+    || !closeEnough(row.notional_usd_requested, Number(carryNotionalUsd.value))
+    || !closeEnough(row.horizon_hours, Number(carryHorizonHours.value))) {
+    return t('scanner.carryRescanRequired')
+  }
+
+  const rows = venue.forward ?? []
+  const current = rows.find((candidate) =>
+    carryCandidateIdentity(candidate, venue.venue) === carryCandidateIdentity(row, venue.venue),
+  )
+  if (!current) return t('scanner.carryCandidateMismatch')
+  const snapshotTs = positiveNumber(row.snapshot_ts_ms)
+  const snapshotObservedTs = positiveNumber(row.snapshot_observed_at_ms)
+  const fundingObservedTs = positiveNumber(row.funding_observed_at_ms)
+  const spotBookTs = positiveNumber(row.spot_book_observed_at_ms)
+  const perpBookTs = positiveNumber(row.perp_book_observed_at_ms)
+  const spotInstrumentTs = positiveNumber(row.spot_instrument_snapshot_observed_at_ms)
+  const perpInstrumentTs = positiveNumber(row.perp_instrument_snapshot_observed_at_ms)
+  const spotSourceTs = positiveNumber(row.spot_book_source_ts_ms)
+  const perpSourceTs = positiveNumber(row.perp_book_source_ts_ms)
+  const historyTs = positiveNumber(row.history_latest_ts)
+  const intervalHours = positiveNumber(row.interval_h)
+  const maxHistoryGapIntervals = Math.min(
+    positiveNumber(venue.assumptions?.maximum_history_gap_intervals)
+      ?? MAX_CARRY_HISTORY_GAP_INTERVALS,
+    MAX_CARRY_HISTORY_GAP_INTERVALS,
+  )
+  const sampleCount = row.history_samples
+  if (!snapshotTs || !snapshotObservedTs || !fundingObservedTs
+    || !spotBookTs || !perpBookTs || !spotInstrumentTs || !perpInstrumentTs
+    || !spotSourceTs || !perpSourceTs || !historyTs || !intervalHours
+    || !isFiniteNumber(sampleCount) || sampleCount < MIN_CARRY_HISTORY_SAMPLES
+    || !isFiniteNumber(row.source_timestamp_skew_ms)
+    || row.snapshot_estimate !== true) {
+    return t('scanner.carryCandidateMismatch')
+  }
+
+  const now = currentTimeMs.value
+  const snapshotAge = now - snapshotTs
+  const fundingMaxAgeMs = (positiveNumber(venue.assumptions?.maximum_funding_snapshot_age_sec)
+    ?? MAX_CARRY_BOOK_AGE_MS / 1000) * 1000
+  const bookMaxAgeMs = (positiveNumber(venue.assumptions?.maximum_order_book_age_sec)
+    ?? MAX_CARRY_BOOK_AGE_MS / 1000) * 1000
+  const sourceSkewMaxMs = (positiveNumber(venue.assumptions?.maximum_source_timestamp_skew_sec)
+    ?? MAX_CARRY_SOURCE_SKEW_MS / 1000) * 1000
+  const instrumentMaxAgeMs = (positiveNumber(venue.assumptions?.maximum_instrument_snapshot_age_sec)
+    ?? MAX_CARRY_INSTRUMENT_AGE_MS / 1000) * 1000
+  const timestamps = [snapshotObservedTs, fundingObservedTs, spotBookTs, perpBookTs, spotInstrumentTs, perpInstrumentTs]
+  if (snapshotAge < -MAX_CARRY_FUTURE_SKEW_MS || snapshotAge > MAX_CARRY_SNAPSHOT_AGE_MS
+    || timestamps.some((stamp) => stamp - now > MAX_CARRY_FUTURE_SKEW_MS)
+    || now - snapshotObservedTs > MAX_CARRY_SNAPSHOT_AGE_MS
+    || now - fundingObservedTs > fundingMaxAgeMs
+    || [spotInstrumentTs, perpInstrumentTs].some((stamp) => now - stamp > instrumentMaxAgeMs)) {
+    return t('scanner.carryCandidateStale')
+  }
+  if (Math.abs(spotBookTs - perpBookTs) > MAX_CARRY_BOOK_SKEW_MS
+    || [spotBookTs, perpBookTs].some((stamp) =>
+      now - stamp > bookMaxAgeMs || stamp - now > MAX_CARRY_FUTURE_SKEW_MS,
+    )) {
+    return t('scanner.carryCandidateStale')
+  }
+  if ([spotSourceTs, perpSourceTs].some((stamp) =>
+    now - stamp > bookMaxAgeMs || stamp - now > MAX_CARRY_FUTURE_SKEW_MS,
+  )) return t('scanner.carryCandidateStale')
+  const sourceTimestamps = [fundingObservedTs, spotSourceTs, perpSourceTs]
+  const measuredSourceSkew = Math.max(...sourceTimestamps) - Math.min(...sourceTimestamps)
+  if (row.source_timestamp_skew_ms < 0
+    || row.source_timestamp_skew_ms > sourceSkewMaxMs
+    || Math.abs(measuredSourceSkew - row.source_timestamp_skew_ms) > 1_000) {
+    return t('scanner.carryCandidateStale')
+  }
+  // Compare the latest settled sample to the scan observation, not to the next
+  // scheduled settlement: a valid scan may happen before that settlement.
+  if (historyTs - snapshotTs > MAX_CARRY_FUTURE_SKEW_MS
+    || snapshotTs - historyTs > intervalHours * maxHistoryGapIntervals * 3_600_000) {
+    return t('scanner.carryCandidateStale')
+  }
+
+  const requiredMetrics: Array<keyof CarryCand> = [
+    'gross_funding_usd',
+    'total_estimated_cost_usd',
+    'net_horizon_earnings_usd',
+    'net_horizon_roi_pct',
+    'capital_required_usd',
+    'breakeven_funding_payments',
+    'breakeven_hours_from_snapshot',
+  ]
+  if (requiredMetrics.some((field) => !isFiniteNumber(row[field]) || !isFiniteNumber(current[field])
+    || !closeEnough(row[field], current[field] as number))) {
+    return t('scanner.carryRescanRequired')
+  }
+  const snapshotFields: Array<keyof CarryCand> = [
+    'snapshot_ts_ms',
+    'snapshot_observed_at_ms',
+    'funding_observed_at_ms',
+    'history_first_ts',
+    'history_latest_ts',
+    'history_samples',
+    'next_funding_ts',
+    'interval_h',
+    'funding_payments_estimated',
+    'spot_book_observed_at_ms',
+    'perp_book_observed_at_ms',
+    'spot_book_source_ts_ms',
+    'perp_book_source_ts_ms',
+    'spot_book_request_started_at_ms',
+    'perp_book_request_started_at_ms',
+    'spot_instrument_snapshot_observed_at_ms',
+    'perp_instrument_snapshot_observed_at_ms',
+    'source_timestamp_skew_ms',
+  ]
+  if (snapshotFields.some((field) => row[field] !== current[field]
+    && !closeEnough(row[field], current[field]))) {
+    return t('scanner.carryCandidateMismatch')
+  }
+  if (carryCandidateIdentity(row, row._venue) !== carryCandidateIdentity(current, venue.venue)) {
+    return t('scanner.carryCandidateMismatch')
+  }
+  return ''
+}
+
+function paperOpenBlock(target: OpenTarget): string {
+  if (target.kind !== 'carry') {
+    return t('scanner.paperCarryOnly')
+  }
+  if (!hasApiToken.value || !getApiToken()) return t('scanner.authRequired')
+  if (target.row._direction !== 'forward') {
+    return t('scanner.paperCarryOnly')
+  }
+  if (!(SUPPORTED_CEX_UI_VENUES as readonly string[]).includes(target.row._venue)) {
+    return t('scanner.paperCarryOnly')
+  }
+  const candidateBlock = carryCandidateBlock(target.row)
+  if (candidateBlock) return candidateBlock
+  return venueTradeBlock(target.row._venue)
+}
+
+function showOpenDialog(target: OpenTarget) {
+  const block = paperOpenBlock(target)
+  if (block) {
+    message.warning(block)
+    return
+  }
+  openTarget.value = target
+  showOpenModal.value = true
+}
+
 async function confirmOpen() {
-  const tgt = openTarget.value
-  if (!tgt) return
+  const target = openTarget.value
+  if (!target) return
+  const block = paperOpenBlock(target)
+  if (block) {
+    message.error(block)
+    showOpenModal.value = false
+    return
+  }
+  if (target.kind !== 'carry') return
+
   opening.value = true
   try {
-    if (openMode.value === 'wallet') {
-      await confirmOpenWallet(tgt)
-      return
+    const row = target.row
+    const scan = carryData.value.find((venue) => venue.venue === row._venue)
+    if (!scan?.snapshot_id || !row.snapshot_id) {
+      throw new Error(t('scanner.carryCandidateMismatch'))
     }
-    let body: Record<string, unknown>
-    if (tgt.kind === 'pure') {
-      const r = tgt.row
-      body = {
-        strategy: 'pure_futures',
-        base: r.base,
-        long_venue: r.long_venue,
-        short_venue: r.short_venue,
-        amount_usd: openAmount.value,
-        direction: r.direction.toLowerCase(),
-        dry_run: openDryRun.value,
-      }
-    } else if (tgt.kind === 'carry') {
-      const r = tgt.row
-      body = {
-        strategy: 'carry',
-        base: r.base,
-        futures_venue: r._venue,
-        spot_venue: r._venue,
-        amount_usd: openAmount.value,
-        direction: r._direction,
-        dry_run: openDryRun.value,
-      }
-    } else {
-      const r = tgt.row
-      body = {
-        strategy: 'unified',
-        base: r.base,
-        futures_venue: r.futures_venue,
-        spot_venue: r.spot_venue,
-        amount_usd: openAmount.value,
-        direction: (r.direction || 'forward').toLowerCase(),
-        dry_run: openDryRun.value,
-      }
-    }
-    await post('/positions/open', body)
-    const base = tgt.kind === 'pure' ? tgt.row.base : tgt.row.base
-    message.success(t('scanner.opened', { base, mode: openDryRun.value ? 'dry-run' : 'LIVE' }))
+    await openCarryPaperPosition({
+      strategy: 'carry',
+      base: row.base,
+      symbol: row.symbol,
+      futures_venue: row._venue,
+      spot_venue: row._venue,
+      amount_usd: Number(row.notional_usd_requested),
+      horizon_hours: Number(row.horizon_hours),
+      direction: 'forward',
+      dry_run: true,
+      scan_snapshot_id: scan.snapshot_id,
+      candidate_snapshot_id: row.snapshot_id,
+    })
+    message.success(t('scanner.opened', { base: row.base, mode: 'paper' }))
     showOpenModal.value = false
   } catch (e) {
     message.error(e instanceof Error ? e.message : t('scanner.failedToOpen'))
@@ -972,104 +1223,6 @@ async function confirmOpen() {
   }
 }
 
-/**
- * Wallet-signed open: place one leg via browser wallet (HL/dYdX).
- * The other leg (CEX or non-wallet DEX) is NOT auto-placed here —
- * the user must manage it separately or use backend mode for both legs.
- */
-async function confirmOpenWallet(tgt: OpenTarget) {
-  if (tgt.kind !== 'pure') {
-    message.error(t('scanner.walletNoEligible'))
-    opening.value = false
-    return
-  }
-  const r = tgt.row
-  const base = r.base
-
-  // Determine which leg to place via wallet
-  const longWallet = (WALLET_TRADE_VENUES as readonly string[]).includes(r.long_venue) && isWalletConnected(r.long_venue)
-  const shortWallet = (WALLET_TRADE_VENUES as readonly string[]).includes(r.short_venue) && isWalletConnected(r.short_venue)
-
-  if (!longWallet && !shortWallet) {
-    message.error(t('scanner.walletNoEligible'))
-    opening.value = false
-    return
-  }
-
-  // Get real price for size conversion (USD → base currency)
-  let price = await fetchBasePrice(base)
-  if (price <= 0) {
-    message.error('Cannot determine market price for size calculation. Please scan first.')
-    opening.value = false
-    return
-  }
-  const size = openAmount.value / price
-
-  try {
-    // Lazy-load the wallet trade module (ethers + @nktkas/hyperliquid)
-    const mod = await getWalletTrade()
-    const { placeOrder: walletPlaceOrder, ensureAgent } = mod.useWalletTrade()
-
-    // Ensure agent is ready for wallet venues
-    for (const v of [r.long_venue, r.short_venue]) {
-      if ((WALLET_TRADE_VENUES as readonly string[]).includes(v) && isWalletConnected(v)) {
-        await ensureAgent(v)
-      }
-    }
-
-    const results: Array<{ venue: string; success: boolean; error?: string }> = []
-
-    // Place long leg if wallet-capable
-    if (longWallet) {
-      const result = await walletPlaceOrder({
-        venue: r.long_venue,
-        coin: base,
-        isBuy: true,
-        size,
-        slippage: 0.01,
-      })
-      results.push({ venue: r.long_venue, ...result })
-    }
-
-    // Place short leg if wallet-capable
-    if (shortWallet) {
-      const result = await walletPlaceOrder({
-        venue: r.short_venue,
-        coin: base,
-        isBuy: false,
-        size,
-        slippage: 0.01,
-      })
-      results.push({ venue: r.short_venue, ...result })
-    }
-
-    const allOk = results.every(r => r.success)
-    if (allOk) {
-      const venues = results.map(r => r.venue).join(', ')
-      message.success(`${t('scanner.opened', { base, mode: 'wallet' })} (${venues})`)
-      showOpenModal.value = false
-    } else {
-      const failed = results.filter(r => !r.success).map(r => `${r.venue}: ${r.error}`).join('; ')
-      message.error(`${t('scanner.failedToOpen')} — ${failed}`)
-    }
-
-    // Warn about unplaced legs
-    const unplacedLegs: string[] = []
-    if (!longWallet && (WALLET_TRADE_VENUES as readonly string[]).includes(r.long_venue) === false) {
-      unplacedLegs.push(`${r.long_venue} (long)`)
-    }
-    if (!shortWallet && (WALLET_TRADE_VENUES as readonly string[]).includes(r.short_venue) === false) {
-      unplacedLegs.push(`${r.short_venue} (short)`)
-    }
-    if (unplacedLegs.length > 0) {
-      message.warning(`${t('scanner.walletMixedMode')}: ${unplacedLegs.join(', ')}`)
-    }
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : t('scanner.failedToOpen'))
-  } finally {
-    opening.value = false
-  }
-}
 
 // ---- Pure Futures ----
 type BasisRiskLevel = 'clean' | 'caution' | 'high'
@@ -1186,13 +1339,13 @@ const pureColumns = computed<DataTableColumns<PureRow>>(() => [
     render: (row) => h(NText, { type: row.net_apy_pct > 0 ? 'success' : 'error' }, { default: () => row.net_apy_pct.toFixed(0) + '%' }) },
   { title: t('scanner.action'), key: 'actions', width: 80,
     render: (row) => {
-      const block = rowTradeBlock(row)
+      const block = paperOpenBlock({ kind: 'pure', row })
       const riskHint = pureRowRiskHint(row)
       return h(NButton, {
         size: 'tiny', type: 'primary', secondary: true,
         disabled: !!block,
         title: block || riskHint || undefined,
-        onClick: () => showOpenDialog({ kind: 'pure', row }),
+        onClick: block ? undefined : () => showOpenDialog({ kind: 'pure', row }),
       }, { default: () => t('scanner.open') })
     } },
 ])
@@ -1207,6 +1360,93 @@ function carryRowsForVenue(ven: CarryVenue): CarryRow[] {
   ]
 }
 
+function formatUsd(value: number | null | undefined): string {
+  if (!isFiniteNumber(value)) return '—'
+  const amount = Math.abs(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return `${value < 0 ? '-$' : '$'}${amount}`
+}
+
+function formatPercent(value: number | null | undefined): string {
+  return isFiniteNumber(value) ? `${value.toFixed(4)}%` : '—'
+}
+
+function formatTimestamp(value: number | null | undefined): string {
+  const timestamp = positiveNumber(value)
+  if (timestamp === null) return '—'
+  try {
+    return new Date(timestamp).toISOString().replace('T', ' ').replace('Z', ' UTC')
+  } catch {
+    return '—'
+  }
+}
+
+function carryRoi(row: CarryRow): { oneLeg: number | null; capital: number | null } {
+  const net = isFiniteNumber(row.net_horizon_earnings_usd) ? row.net_horizon_earnings_usd : null
+  const oneLeg = isFiniteNumber(row.net_horizon_notional_roi_pct)
+    ? row.net_horizon_notional_roi_pct
+    : isFiniteNumber(row.net_horizon_roi_pct)
+      ? row.net_horizon_roi_pct
+    : net !== null && positiveNumber(row.notional_usd_requested)
+      ? net / Number(row.notional_usd_requested) * 100
+      : null
+  const capital = isFiniteNumber(row.net_horizon_capital_roi_pct)
+    ? row.net_horizon_capital_roi_pct
+    : net !== null && positiveNumber(row.capital_required_usd)
+      ? net / Number(row.capital_required_usd) * 100
+      : null
+  return { oneLeg, capital }
+}
+
+function carryCostAssumptions(row: CarryRow): string {
+  const spotFee = isFiniteNumber(row.spot_fee_pct) ? row.spot_fee_pct : null
+  const perpFee = isFiniteNumber(row.perp_fee_pct) ? row.perp_fee_pct : row.futures_fee_pct ?? null
+  return [
+    `${t('scanner.carryEntryFees')}: ${formatUsd(row.entry_fee_usd)} (spot ${formatPercent(spotFee)}, perp ${formatPercent(perpFee)})`,
+    `${t('scanner.carryExitFees')}: ${formatUsd(row.exit_fee_usd)}`,
+    `${t('scanner.carryBookCost')}: ${formatUsd(row.observed_round_trip_book_cost_usd)}`,
+    `${t('scanner.carryExitSlippage')}: ${formatUsd(row.exit_slippage_assumption_usd)} (${row.exit_slippage_bps_per_leg ?? '—'} bps/leg)`,
+    `${t('scanner.carryBasisBuffer')}: ${formatUsd(row.basis_buffer_usd)} (${row.basis_buffer_bps ?? '—'} bps)`,
+  ].join('\n')
+}
+
+function carrySnapshotCell(row: CarryRow) {
+  return h('div', { class: 'carry-snapshot-cell' }, [
+    h('strong', { title: snapshotIdentity(row) }, `${t('scanner.carrySnapshotIdentity')}: ${snapshotIdentity(row)}`),
+    h('small', `${t('scanner.carrySnapshotAt')}: ${formatTimestamp(row.snapshot_ts_ms)}`),
+    h('small', `${t('scanner.carrySnapshotObservedAt')}: ${formatTimestamp(row.snapshot_observed_at_ms)}`),
+    h('small', `${t('scanner.carryFundingObservedAt')}: ${formatTimestamp(row.funding_observed_at_ms)}`),
+    h('small', `${t('scanner.carrySpotBookAt')}: ${formatTimestamp(row.spot_book_observed_at_ms)}`),
+    h('small', `${t('scanner.carryPerpBookAt')}: ${formatTimestamp(row.perp_book_observed_at_ms)}`),
+    h('small', `${t('scanner.carrySpotInstrumentAt')}: ${formatTimestamp(row.spot_instrument_snapshot_observed_at_ms)}`),
+    h('small', `${t('scanner.carryPerpInstrumentAt')}: ${formatTimestamp(row.perp_instrument_snapshot_observed_at_ms)}`),
+    h('small', `${t('scanner.carryHistoryRange')}: ${formatTimestamp(row.history_first_ts)}`),
+    h('small', `${t('scanner.carryHistoryAt')}: ${formatTimestamp(row.history_latest_ts)}`),
+    h('small', `${t('scanner.carrySourceSkew')}: ${row.source_timestamp_skew_ms ?? '—'} ms`),
+  ])
+}
+
+function carryCostCell(row: CarryRow) {
+  return h(NTooltip, { trigger: 'hover' }, {
+    trigger: () => h('span', { class: 'carry-cost-value', tabindex: 0 }, formatUsd(row.total_estimated_cost_usd)),
+    default: () => h('pre', { class: 'carry-cost-breakdown' }, carryCostAssumptions(row)),
+  })
+}
+
+function carryRoiCell(row: CarryRow) {
+  const roi = carryRoi(row)
+  return h(NTooltip, { trigger: 'hover' }, {
+    trigger: () => h('div', { class: 'carry-roi-cell' }, [
+      h('small', t('scanner.oneLegNotionalRoi')),
+      h('strong', formatPercent(roi.oneLeg)),
+      h('small', t('scanner.illustrativeCapitalRoi')),
+      h('strong', formatPercent(roi.capital)),
+    ]),
+    default: () => h('span', t('scanner.capitalRoiAssumption', {
+      capital: formatUsd(row.capital_required_usd),
+    })),
+  })
+}
+
 // In demo mode, hide venues the user has deselected (the snapshot holds every
 // scanned venue; client-side filtering is the only way to narrow the view). In
 // live mode the backend rescans only the selected venues, so the data is
@@ -1215,6 +1455,19 @@ const carryVenues = computed(() => {
   if (!isDemoMode || selectedVenues.value.length === 0) return carryData.value
   const sel = new Set(selectedVenues.value)
   return carryData.value.filter((v) => sel.has(v.venue))
+})
+const carryScanMatchesInputs = computed(() => carryScanInputsValid.value && carryDataMatchesInputs(
+  carryData.value,
+  Number(carryNotionalUsd.value),
+  Number(carryHorizonHours.value),
+))
+const carryRequiresRescan = computed(() => {
+  if (!carryData.value.length || !carryScanMatchesInputs.value) return carryData.value.length > 0
+  return carryVenues.value.some((venue) =>
+    (venue.forward ?? []).some((candidate) =>
+      !!carryCandidateBlock({ ...candidate, _venue: venue.venue, _direction: 'forward' }),
+    ),
+  )
 })
 const carryTotalFwd = computed(() => carryVenues.value.reduce((s, v) => s + (v.forward?.length ?? 0), 0))
 const carryTotalRev = computed(() => carryVenues.value.reduce((s, v) => s + (v.reverse?.length ?? 0), 0))
@@ -1227,20 +1480,35 @@ const carryStatCards = computed(() => [
 
 const carryColumns = computed<DataTableColumns<CarryRow>>(() => [
   { title: t('scanner.pair'), key: 'base', width: 90, render: (row) => `${row.base}/USDT` },
-  { title: t('scanner.type'), key: 'type', width: 80, render: (row) => h(NTag, { size: 'small', type: row._direction === 'forward' ? 'success' : 'warning', bordered: false }, { default: () => row._direction === 'forward' ? t('scanner.forward') : t('scanner.reverse') }) },
-  { title: t('scanner.rate'), key: 'rate_pct', width: 100, render: (row) => (row.rate_pct ?? 0).toFixed(4) + '%' },
-  { title: t('scanner.ann'), key: 'annual_pct', width: 80, render: (row) => (row.annual_pct ?? 0).toFixed(0) + '%' },
-  { title: t('scanner.spotBorrow'), key: 'spot', width: 100, render: (row) => row.has_spot === true ? 'Spot: $' + (row.spot_price ?? 0).toFixed(2) : row.borrowable === true ? 'Borrow' : 'N/A' },
-  { title: t('scanner.netEdge'), key: 'net_edge_pct', width: 100, sorter: (a, b) => (a.net_edge_pct ?? 0) - (b.net_edge_pct ?? 0),
-    render: (row) => h(NText, { type: (row.net_edge_pct ?? 0) > 0 ? 'success' : 'error', strong: true }, { default: () => (row.net_edge_pct ?? 0).toFixed(4) + '%' }) },
+  { title: t('scanner.scannedNotional'), key: 'notional_usd_requested', width: 130,
+    render: (row) => h('div', [
+      h('strong', formatUsd(row.notional_usd_requested)),
+      h('small', `${t('scanner.actualSpotNotional')}: ${formatUsd(row.spot_notional_usd)}`),
+    ]) },
+  { title: t('scanner.carryGrossUsd'), key: 'gross_funding_usd', width: 120,
+    render: (row) => h(NText, { type: 'success', strong: true }, { default: () => formatUsd(row.gross_funding_usd) }) },
+  { title: t('scanner.carryCosts'), key: 'total_estimated_cost_usd', width: 130,
+    render: (row) => carryCostCell(row) },
+  { title: t('scanner.carryNetUsd'), key: 'net_horizon_earnings_usd', width: 120,
+    render: (row) => h(NText, { type: (row.net_horizon_earnings_usd ?? 0) >= 0 ? 'success' : 'error', strong: true }, { default: () => formatUsd(row.net_horizon_earnings_usd) }) },
+  { title: t('scanner.carryRoi'), key: 'net_horizon_roi_pct', width: 205, render: (row) => carryRoiCell(row) },
+  { title: t('scanner.carryBreakeven'), key: 'breakeven_funding_payments', width: 150,
+    render: (row) => h('div', [
+      h('strong', `${row.breakeven_funding_payments ?? '—'} ${t('scanner.carryPayments')}`),
+      h('small', `${row.breakeven_hours_from_snapshot?.toFixed(2) ?? '—'}h · ${formatPercent(row.breakeven_rate_pct)}`),
+    ]) },
+  { title: t('scanner.rate'), key: 'expected_rate_pct', width: 100,
+    render: (row) => formatPercent(row.expected_rate_pct ?? row.rate_pct) },
+  { title: t('scanner.carrySnapshot'), key: 'snapshot_ts_ms', width: 300,
+    render: (row) => carrySnapshotCell(row) },
   { title: t('scanner.action'), key: 'actions', width: 80,
     render: (row) => {
-      const block = venueTradeBlock(row._venue)
+      const block = paperOpenBlock({ kind: 'carry', row })
       return h(NButton, {
         size: 'tiny', type: 'primary', secondary: true,
         disabled: !!block,
         title: block || undefined,
-        onClick: () => showOpenDialog({ kind: 'carry', row }),
+        onClick: block ? undefined : () => showOpenDialog({ kind: 'carry', row }),
       }, { default: () => t('scanner.open') })
     } },
 ])
@@ -1277,32 +1545,54 @@ const unifiedColumns = computed<DataTableColumns<UnifiedCarryCand>>(() => [
   { title: t('scanner.annual'), key: 'annual_pct', width: 80, render: (row) => (row.annual_pct ?? 0).toFixed(0) + '%' },
   { title: t('scanner.action'), key: 'actions', width: 80,
     render: (row) => {
-      const block = venueTradeBlock(row.futures_venue, row.spot_venue)
+      const block = paperOpenBlock({ kind: 'unified', row })
       return h(NButton, {
         size: 'tiny', type: 'primary', secondary: true,
         disabled: !!block,
         title: block || undefined,
-        onClick: () => showOpenDialog({ kind: 'unified', row }),
+        onClick: block ? undefined : () => showOpenDialog({ kind: 'unified', row }),
       }, { default: () => t('scanner.open') })
     } },
 ])
 
+const unsubscribeApiToken = subscribeApiToken((token) => {
+  hasApiToken.value = Boolean(token)
+  if (isDemoMode) return
+  if (!token) {
+    venueCaps.value = {}
+    showOpenModal.value = false
+    return
+  }
+  void loadStrategyVenues()
+  void loadVenueCapabilities()
+  void loadData(strategy.value)
+})
+
+let _candidateClockTimer: ReturnType<typeof setInterval> | null = null
+
 onMounted(async () => {
+  _candidateClockTimer = setInterval(() => {
+    currentTimeMs.value = Date.now()
+  }, 5000)
   // In demo mode, prime the snapshot first so loadStrategyVenues() /
   // loadVenueCapabilities() have data to read from.
   if (isDemoMode) {
     await useDemoSnapshot().ensure()
   }
-  await loadStrategyVenues()
-  loadVenueCapabilities()
-  loadData()
+  if (isDemoMode || getApiToken()) {
+    await loadStrategyVenues()
+    loadVenueCapabilities()
+    loadData()
+  }
   // WebSocket is backend-only — skip in demo mode to avoid the endless
   // reconnect loop against a static host.
   if (!isDemoMode) ws.connect()
 })
 onUnmounted(() => {
   ws.disconnect()
+  unsubscribeApiToken()
   if (_venuesWatchTimer) clearTimeout(_venuesWatchTimer)
+  if (_candidateClockTimer) clearInterval(_candidateClockTimer)
 })
 </script>
 
@@ -1575,6 +1865,34 @@ onUnmounted(() => {
 .edge-input :deep(.n-input__input-el) {
   min-width: 1.5ch;
   text-align: left;
+}
+
+.carry-input { width: 128px; }
+:deep(.carry-snapshot-cell) {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+:deep(.carry-snapshot-cell small),
+:deep(.carry-roi-cell small) {
+  color: rgba(255, 255, 255, 0.55);
+}
+:deep(.carry-roi-cell) {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  font-size: 11px;
+}
+:deep(.carry-cost-value) { cursor: help; text-decoration: underline dotted; }
+:deep(.carry-cost-breakdown) {
+  margin: 0;
+  max-width: 360px;
+  white-space: pre-wrap;
+  font: inherit;
+  line-height: 1.5;
 }
 
 /* 周期：下拉选择，与 Tab / Chip 形态区分 */

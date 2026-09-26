@@ -28,6 +28,8 @@ import random
 import time
 from typing import Any
 
+from core.credentials import redact_secret_values
+from core.execution_policy import block_real_execution, require_dry_run
 from venues.http_util import http_get_json
 from venues.lighter_funding import LighterFundingProvider
 
@@ -234,6 +236,7 @@ class LighterVenue:
         is_ask: bool,
         reduce_only: bool,
     ) -> tuple[Any, Any, str | None]:
+        block_real_execution("Lighter order submission")
         client = self._make_signer()
         try:
             tx, resp, err = await client.create_market_order(
@@ -266,6 +269,7 @@ class LighterVenue:
             open_long / close_short → bid (is_ask=False), reduce_only on close
             open_short / close_long → ask (is_ask=True), reduce_only on close
         """
+        require_dry_run(dry_run, "Lighter order execution")
         results: list[dict[str, Any]] = []
         for trade in trades:
             symbol = trade["symbol"]
@@ -334,7 +338,7 @@ class LighterVenue:
                 if err:
                     record["status"] = "failed"
                     record["order_id"] = None
-                    record["error"] = str(err)
+                    record["error"] = redact_secret_values(err)
                 else:
                     record["status"] = "filled"
                     record["order_id"] = str(getattr(resp, "tx_hash", "") or "")
@@ -349,6 +353,6 @@ class LighterVenue:
             except Exception as e:
                 record["status"] = "failed"
                 record["order_id"] = None
-                record["error"] = str(e)
+                record["error"] = redact_secret_values(e)
             results.append(record)
         return results

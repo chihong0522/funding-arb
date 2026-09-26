@@ -9,11 +9,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import venues.edgex as edgex_mod
 import venues.edgex_funding as ef
+from core.execution_policy import LiveExecutionDisabled
 from venues.edgex import (
     EdgexVenue,
     _base_from_pair,
@@ -40,7 +43,7 @@ _META = {
 }
 
 
-def _stub_sdk() -> None:
+def _stub_sdk(monkeypatch) -> None:
     """Inject a fake `edgex_sdk` so live-order code paths can be exercised."""
 
     class OrderSide(Enum):
@@ -51,7 +54,7 @@ def _stub_sdk() -> None:
         def __init__(self, **kw):
             self.kw = kw
 
-    sys.modules["edgex_sdk"] = SimpleNamespace(Client=Client, OrderSide=OrderSide)
+    monkeypatch.setitem(sys.modules, "edgex_sdk", SimpleNamespace(Client=Client, OrderSide=OrderSide))
 
 
 def _fresh() -> EdgexVenue:
@@ -193,19 +196,26 @@ class TestExecution:
         assert results[0]["venue"] == "edgex"
         assert results[0]["exec_price"] == 63500.0
 
-    def test_unknown_type_fails(self):
+    def test_live_request_is_blocked_before_trade_validation_or_submission(self):
         v = EdgexVenue()
-        results = v.execute_trades(
-            [{"symbol": "BTCUSDT", "type": "rebalance", "amount_base": 1}],
-            {"BTCUSDT": {"price": 1.0}},
-            dry_run=False,
-        )
-        assert results[0]["status"] == "failed"
-        assert "Unknown trade type" in results[0]["error"]
+        submissions = []
 
-    def test_live_side_and_formatting(self):
-        """open_long → BUY @ +2%; open_short → SELL @ −2%; size/price string-formatted."""
-        _stub_sdk()
+        async def fake_submit(*args):
+            submissions.append(args)
+            return {"data": {"orderId": "never-submitted"}}
+
+        v._submit_limit_order = fake_submit  # type: ignore[method-assign]
+        with pytest.raises(LiveExecutionDisabled):
+            v.execute_trades(
+                [{"symbol": "BTCUSDT", "type": "rebalance", "amount_base": 1}],
+                {"BTCUSDT": {"price": 1.0}},
+                dry_run=False,
+            )
+        assert submissions == []
+
+    def test_order_side_and_formatting_with_fake_transport(self, monkeypatch):
+        """open_long → BUY @ +2%; open_short → SELL @ −2%; sizes/prices formatted."""
+        _stub_sdk(monkeypatch)
         expected = {
             "open_long": ("BUY", 63500.0 * 1.02),
             "open_short": ("SELL", 63500.0 * 0.98),
@@ -224,6 +234,9 @@ class TestExecution:
                     return {"data": {"orderId": "ord-123"}}
 
                 v._submit_limit_order = fake_submit  # type: ignore[method-assign]
+                # Only this test-local path reaches the adapter algorithm; the
+                # installed submit method is a coroutine fake, never the SDK.
+                monkeypatch.setattr(edgex_mod, "require_dry_run", lambda *_: None)
                 results = v.execute_trades(
                     [{"symbol": "BTCUSDT", "type": typ, "amount_base": 0.01}],
                     {"BTCUSDT": {"price": 63500.0}},
@@ -236,8 +249,8 @@ class TestExecution:
             assert captured["size"] == "0.010"  # step 0.001 → 3dp
             assert captured["price"] == f"{bound:.1f}"  # tick 0.1 → 1dp
 
-    def test_live_sdk_error_marks_failed(self):
-        _stub_sdk()
+    def test_fake_transport_error_marks_failed(self, monkeypatch):
+        _stub_sdk(monkeypatch)
         with patch.object(ef, "http_get_json", return_value=_META):
             v = _fresh()
 
@@ -245,13 +258,15 @@ class TestExecution:
                 raise RuntimeError("signature rejected")
 
             v._submit_limit_order = fake_submit  # type: ignore[method-assign]
+            monkeypatch.setattr(edgex_mod, "require_dry_run", lambda *_: None)
             results = v.execute_trades(
                 [{"symbol": "BTCUSDT", "type": "open_long", "amount_base": 0.01}],
                 {"BTCUSDT": {"price": 63500.0}},
                 dry_run=False,
             )
         assert results[0]["status"] == "failed"
-        assert "signature rejected" in results[0]["error"]
+        assert "[REDACTED]" in results[0]["error"]
+        assert "signature rejected" not in results[0]["error"]
 
 
 class TestRegistration:
