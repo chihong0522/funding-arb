@@ -358,13 +358,17 @@ funding-arb/
 
 ---
 
-## Testing
+## Testing and paper-only install
+
+The default paper Binance/Bybit profile is hash-locked and excludes optional DEX SDKs:
 
 ```bash
-pip install -r requirements.txt   # or: bash setup.sh
+python3 -m pip install --require-hashes -r requirements.paper.lock
 .venv/bin/python -m pytest scripts/tests/ -q
-# 370+ tests — scanners, fees, venues (incl. HL/Aster/Lighter/EdgeX), executor, backtest, notify
+# Full existing suite — do not exclude venue tests just because DEX SDKs are absent.
 ```
+
+`start.sh`, `start.ps1`, `setup.sh`, and the Python CI/scanner paths use this same lock. The broader `requirements.lock` is a separate optional-DEX compatibility profile with documented dependency findings; it is not the default paper runtime. The Telegram workflow rejects `include_dex: true` before checkout or dependency installation because that profile is unsupported here.
 
 ---
 

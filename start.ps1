@@ -14,6 +14,7 @@ param(
 )
 
 Set-Location $PSScriptRoot
+$PaperRequirements = Join-Path $PSScriptRoot "requirements.paper.lock"
 
 if ($Help) {
     Write-Host ""
@@ -58,12 +59,20 @@ function Check-Rust {
 }
 
 function Install-PythonDeps {
-    $has = & $Python -c "import fastapi" 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  -> Installing Python dependencies..." -ForegroundColor Cyan
-        & $Python -m pip install -q fastapi "uvicorn[standard]" websockets requests
+    if (-not (Test-Path -LiteralPath $PaperRequirements -PathType Leaf)) {
+        Write-Host "  Missing $PaperRequirements; restore the paper dependency lock before starting" -ForegroundColor Red
+        exit 1
     }
-    Write-Host "  [OK] Python dependencies ready" -ForegroundColor Green
+    Write-Host "  -> Installing/verifying hash-locked paper Python dependencies..." -ForegroundColor Cyan
+    & $Python -m pip install `
+        --disable-pip-version-check `
+        --no-input `
+        --require-hashes `
+        -r $PaperRequirements
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    Write-Host "  [OK] Paper Python dependencies ready (Binance/Bybit scope; optional DEX SDKs excluded)" -ForegroundColor Green
 }
 
 function Install-NodeDeps {

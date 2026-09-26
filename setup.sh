@@ -3,10 +3,16 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+PAPER_REQUIREMENTS="$ROOT/requirements.paper.lock"
+
+if [[ ! -f "$PAPER_REQUIREMENTS" ]]; then
+  echo "Paper dependency lock is missing: $PAPER_REQUIREMENTS" >&2
+  exit 1
+fi
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
-  echo "Created .env from .env.example — edit before live trading."
+  echo "Created .env from .env.example — edit for paper/test configuration; live trading is not supported by this fork."
 fi
 
 mkdir -p data output runs/.state
@@ -16,6 +22,13 @@ if ! python3 -c "import json" 2>/dev/null; then
   echo "Python 3 required."
   exit 1
 fi
+
+printf '%s\n' "Installing/verifying hash-locked paper dependencies..."
+python3 -m pip install \
+  --disable-pip-version-check \
+  --no-input \
+  --require-hashes \
+  -r "$PAPER_REQUIREMENTS"
 
 echo ""
 echo "Setup complete."

@@ -39,7 +39,7 @@ Authorization: Bearer <fine-grained PAT>
     "source": "cron",
     "min_edge": "0.0",
     "top_n": "10",
-    "include_dex": true
+    "include_dex": false
   }
 }
 ```

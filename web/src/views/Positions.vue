@@ -14,12 +14,7 @@ import { getPositions, getResolvedFees, post, type PositionItem } from '@/compos
 import { useI18n } from 'vue-i18n'
 import { SUPPORTED_CEX_UI_VENUES } from '@/constants/venueOrder'
 import VChart from 'vue-echarts'
-import { use } from 'echarts/core'
-import { CanvasRenderer } from 'echarts/renderers'
-import { LineChart } from 'echarts/charts'
-import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
-
-use([LineChart, GridComponent, TooltipComponent, LegendComponent, CanvasRenderer])
+import { buildPositionsEquityChartOption, type PositionsEquityPoint } from '@/charts/equity'
 
 const { t } = useI18n()
 const message = useMessage()
@@ -343,7 +338,7 @@ const summaryCards = computed(() => [
 
 // ─── Equity curve (cumulative realized PnL) ─────────────────
 
-const equityCurveData = computed(() => {
+const equityCurveData = computed<PositionsEquityPoint[]>(() => {
   const closed = allItems.value
     .filter((p) => p.status === 'closed')
     .map((p) => ({
@@ -356,30 +351,13 @@ const equityCurveData = computed(() => {
   let cumulative = 0
   return closed.map((d) => {
     cumulative += d.pnl
-    return [d.time, cumulative]
+    return [d.time!, cumulative]
   })
 })
 
-const equityChartOption = computed(() => ({
-  tooltip: {
-    trigger: 'axis',
-    valueFormatter: (v: number) => '$' + (v ?? 0).toFixed(2),
-  },
-  grid: { left: 50, right: 20, top: 20, bottom: 30 },
-  xAxis: { type: 'time' },
-  yAxis: { type: 'value', name: 'PnL (USD)', scale: true },
-  series: [
-    {
-      type: 'line',
-      data: equityCurveData.value,
-      smooth: true,
-      showSymbol: false,
-      areaStyle: { opacity: 0.1, color: '#18a058' },
-      lineStyle: { width: 2, color: '#18a058' },
-      itemStyle: { color: '#18a058' },
-    },
-  ],
-}))
+const equityChartOption = computed(() =>
+  buildPositionsEquityChartOption(equityCurveData.value)
+)
 
 // ─── Table columns ──────────────────────────────────────────
 

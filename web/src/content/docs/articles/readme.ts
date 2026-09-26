@@ -289,9 +289,9 @@ const zhCN: DocSection[] = [
       {
         type: "formula",
         lines: [
-          "pip install -r requirements.txt",
+          "python3 -m pip install --require-hashes -r requirements.paper.lock",
           ".venv/bin/python -m pytest scripts/tests/ -q",
-          "# 245+ tests — scanners, fees, venues, executor, backtest",
+          "# Full existing suite — optional DEX SDKs are not required for paper tests.",
         ],
       },
     ],
@@ -587,9 +587,9 @@ const zhTW: DocSection[] = [
       {
         type: "formula",
         lines: [
-          "pip install -r requirements.txt",
+          "python3 -m pip install --require-hashes -r requirements.paper.lock",
           ".venv/bin/python -m pytest scripts/tests/ -q",
-          "# 245+ tests — scanners, fees, venues, executor, backtest",
+          "# Full existing suite — optional DEX SDKs are not required for paper tests.",
         ],
       },
     ],
@@ -915,9 +915,9 @@ const en: DocSection[] = [
       {
         type: "formula",
         lines: [
-          "pip install -r requirements.txt",
+          "python3 -m pip install --require-hashes -r requirements.paper.lock",
           ".venv/bin/python -m pytest scripts/tests/ -q",
-          "# 245+ tests — scanners, fees, venues, executor, backtest",
+          "# Full existing suite — optional DEX SDKs are not required for paper tests.",
         ],
       },
     ],

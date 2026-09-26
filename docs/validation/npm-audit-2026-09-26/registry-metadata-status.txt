@@ -1,0 +1,1 @@
+registry_metadata_exit=0

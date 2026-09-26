@@ -6,17 +6,12 @@ import {
   type DataTableColumns,
 } from 'naive-ui'
 import { PlayOutline, RefreshOutline, TrendingUpOutline, TrendingDownOutline, PulseOutline, StatsChartOutline } from '@vicons/ionicons5'
-import { use } from 'echarts/core'
-import { LineChart } from 'echarts/charts'
-import { GridComponent, TooltipComponent } from 'echarts/components'
-import { CanvasRenderer } from 'echarts/renderers'
-import VChart from 'vue-echarts'
 import { getBacktestHistory, post, getVenues, type BacktestResult, type BacktestTrade } from '@/composables/useApi'
+import VChart from 'vue-echarts'
+import { buildBacktestEquityChartOption } from '@/charts/equity'
 import { apiFetch } from '@/composables/apiAuth'
 import { useI18n } from 'vue-i18n'
 
-// Lazy-load echarts only when needed (reduces initial bundle)
-use([LineChart, GridComponent, TooltipComponent, CanvasRenderer])
 
 const { t } = useI18n()
 const message = useMessage()
@@ -99,42 +94,9 @@ const summaryCards = computed(() => {
 
 // ─── Equity curve ──────────────────────────────────────────────
 
-const equityChartOption = computed(() => {
-  const curve = latestResult.value?.equity_curve ?? []
-  if (curve.length === 0) return null
-  return {
-    tooltip: {
-      trigger: 'axis',
-      formatter: (params: { dataIndex: number }[]) => {
-        const idx = params[0]?.dataIndex ?? 0
-        const pt = curve[idx]
-        if (!pt) return ''
-        return `${pt.ts}<br/>Equity: $${pt.equity.toLocaleString()}<br/>Open pairs: ${pt.open_pairs ?? 0}`
-      },
-    },
-    grid: { left: 48, right: 16, top: 24, bottom: 32 },
-    xAxis: {
-      type: 'category',
-      data: curve.map((p) => p.ts.slice(0, 10)),
-      axisLabel: { fontSize: 10 },
-    },
-    yAxis: {
-      type: 'value',
-      scale: true,
-      axisLabel: { formatter: (v: number) => `$${(v / 1000).toFixed(0)}k` },
-    },
-    series: [
-      {
-        type: 'line',
-        data: curve.map((p) => p.equity),
-        smooth: true,
-        showSymbol: false,
-        lineStyle: { width: 2, color: '#18a058' },
-        areaStyle: { color: 'rgba(24, 160, 88, 0.12)' },
-      },
-    ],
-  }
-})
+const equityChartOption = computed(() =>
+  buildBacktestEquityChartOption(latestResult.value?.equity_curve ?? [])
+)
 
 // ─── Actions ───────────────────────────────────────────────────
 

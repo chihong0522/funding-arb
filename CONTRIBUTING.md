@@ -14,9 +14,11 @@ Thanks for your interest in contributing. This is a trading system, so a few ext
 git clone https://github.com/counterfactual5/funding-arb.git
 cd funding-arb
 bash setup.sh
-pip install -r requirements.txt
-pip install -r server/requirements.txt
+# If setup was skipped, use the approved paper-only lock directly:
+python3 -m pip install --require-hashes -r requirements.paper.lock
 ```
+
+The default contributor/paper profile is Binance/Bybit-only and excludes optional DEX SDKs. Do not replace it with `requirements.txt`, `server/requirements.txt`, or the broader `requirements.lock`; those are range-based or optional-DEX compatibility inputs with unresolved findings documented in [`docs/security/python-rust-dependency-audit.md`](docs/security/python-rust-dependency-audit.md).
 
 ## Running tests
 

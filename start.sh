@@ -27,6 +27,8 @@ error() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 # ---------------------------------------------------------------------------
 # Check dependencies
 # ---------------------------------------------------------------------------
+PAPER_REQUIREMENTS="requirements.paper.lock"
+
 check_python() {
     if command -v python3 &>/dev/null; then
         PYTHON="python3"
@@ -53,11 +55,16 @@ check_rust() {
 }
 
 install_python_deps() {
-    if ! $PYTHON -c "import fastapi" 2>/dev/null; then
-        info "Installing Python dependencies..."
-        $PYTHON -m pip install -q fastapi "uvicorn[standard]" websockets requests
+    if [ ! -f "$PAPER_REQUIREMENTS" ]; then
+        error "Missing $PAPER_REQUIREMENTS; restore the paper dependency lock before starting"
     fi
-    ok "Python dependencies ready"
+    info "Installing/verifying hash-locked paper Python dependencies..."
+    "$PYTHON" -m pip install \
+        --disable-pip-version-check \
+        --no-input \
+        --require-hashes \
+        -r "$PAPER_REQUIREMENTS"
+    ok "Paper Python dependencies ready (Binance/Bybit scope; optional DEX SDKs excluded)"
 }
 
 install_node_deps() {
@@ -69,11 +76,11 @@ install_node_deps() {
 }
 
 check_hyperliquid_repo() {
-    # Live Hyperliquid order signing reuses the sibling hyperliquid skill repo.
+    # The sibling repo is not a live-trading capability in this paper-only fork.
     if [ -d "../hyperliquid/scripts" ]; then
-        ok "Hyperliquid skill repo found (live trading available)"
+        ok "Hyperliquid skill repo found (paper scan/dry-run only; live trading remains disabled)"
     else
-        warn "../hyperliquid repo not found — Hyperliquid scan/dry-run only, live orders disabled"
+        warn "../hyperliquid repo not found — paper scan/dry-run only; live trading remains disabled"
     fi
 }
 

@@ -21,10 +21,10 @@ on:
         required: false
         default: 10
       include_dex:
-        description: "Include perp DEX venues in the public snapshot"
+        description: "Unsupported in this paper workflow; true fails closed before checkout or install"
         type: boolean
         required: false
-        default: true
+        default: false
 
 # The default token is read-only. Only the isolated publisher job can write.
 permissions:
@@ -41,16 +41,21 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Reject unsupported DEX opt-in
+        if: ${{ inputs.include_dex == true }}
+        shell: bash
+        run: |
+          echo "::error::DEX scanning is unsupported in this paper workflow; no DEX dependencies are installed."
+          exit 1
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      # Python has no reviewed hash lock yet. Install only the scanner's HTTP
-      # dependency on this disposable runner; no secrets are present in this job.
-      - name: Install scanner dependency
-        run: python -m pip install requests
+      - name: Install hash-locked paper scanner dependencies
+        # The paper workflow is Binance/Bybit only and excludes optional DEX SDKs.
+        run: python -m pip install --require-hashes -r requirements.paper.lock
       - name: Validate dispatch inputs
         env:
           MIN_EDGE: ${{ inputs.min_edge }}
@@ -99,13 +104,12 @@ jobs:
           MIN_EDGE: ${{ inputs.min_edge }}
           TOP_N: ${{ inputs.top_n }}
           SOURCE: ${{ inputs.source }}
-          INCLUDE_DEX: ${{ inputs.include_dex }}
         shell: bash
         run: |
           set -euo pipefail
           args=(--dry-run --min-edge "$MIN_EDGE" --top "$TOP_N" --prev-snapshot /tmp/prev-snapshot.json)
           if [[ "$SOURCE" == "cron" ]]; then args+=(--skip-if-unchanged); fi
-          if [[ "$INCLUDE_DEX" == "true" ]]; then args+=(--include-dex); fi
+          args+=(--venues binance,bybit)
           python scripts/notify/telegram_push.py "${args[@]}" > /tmp/telegram-dry-run.txt
           python - /tmp/telegram-dry-run.txt /tmp/telegram-digest.json <<'PY'
           import ast
@@ -149,12 +153,11 @@ jobs:
       - name: Build demo snapshot
         env:
           MIN_EDGE: ${{ inputs.min_edge }}
-          INCLUDE_DEX: ${{ inputs.include_dex }}
         shell: bash
         run: |
           set -euo pipefail
           args=(--out /tmp/scanner-latest.json --top 30 --min-edge "$MIN_EDGE")
-          if [[ "$INCLUDE_DEX" == "true" ]]; then args+=(--include-dex); fi
+          args+=(--venues binance,bybit)
           python scripts/notify/snapshot_to_pages.py "${args[@]}"
       - name: Upload Telegram digest artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

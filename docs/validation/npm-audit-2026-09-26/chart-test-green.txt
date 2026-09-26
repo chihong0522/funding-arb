@@ -1,0 +1,23 @@
+TAP version 13
+# Subtest: Backtest.vue equity options render through ECharts 6 and escape tooltip text
+ok 1 - Backtest.vue equity options render through ECharts 6 and escape tooltip text
+  ---
+  duration_ms: 72.583295
+  type: 'test'
+  ...
+# Subtest: Positions.vue equity options render time-series tuples through ECharts 6
+ok 2 - Positions.vue equity options render time-series tuples through ECharts 6
+  ---
+  duration_ms: 25.343146
+  type: 'test'
+  ...
+1..2
+# tests 2
+# suites 0
+# pass 2
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 1406.633637
+exit=0

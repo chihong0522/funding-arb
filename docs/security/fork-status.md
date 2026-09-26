@@ -14,12 +14,12 @@ This fork is paper-only. It is not a ready-to-trade release.
 - Phase 2 live execution and verified exchange reconciliation/recovery are NOT complete. Recording an incident and blocking further actions is not a recovery loop.
 - No live trading authorization has been given. Engineering caps and illustrative 1x prefunded short margin are not approved allocations or leverage policy.
 - Jev integration and automated rotation are outside this delivery.
-- Complete dependency vulnerability assessment, reproducible Python hash locks and Rust lock coverage remain outstanding; no guarantee of absence of vulnerabilities/backdoors.
+- Complete dependency vulnerability assessment, optional-DEX compatibility lock findings, and Rust lock coverage remain outstanding; the approved paper-only Python hash lock is verified for the supported Binance/Bybit profile. No guarantee of absence of vulnerabilities/backdoors.
 - Deployment hardening and real exchange execution tests have not been accepted.
 
 ## Verification checkpoint, 2026-09-26
 
-Parent Astra independently executed the final full Python suite in a non-root Docker container with network disabled, read-only scripts/server mounts, no host secrets or Docker socket, and temporary runtime data: **514 passed in 21.52s**.
+Parent Astra's prior independent checkpoint recorded 531 passed in 21.73s. After the final startup/workflow/docs contracts were added, this bounded integration rerun used the same non-root Docker recipe with network disabled, read-only scripts/server mounts, no host secrets or Docker socket, and temporary runtime data; it completed with **534 passed in 21.76s**.
 
 Parent independently verified **19 frontend/CI contract tests passed**, and `npm run build` (vue-tsc plus Vite production build) passed in a network-disabled non-root container. The build needed an executable temporary filesystem for native bundler modules; the root filesystem remained read-only and no secrets/socket were mounted. Vue I18n deprecation and large bundle warnings remain. Static contract tests are not browser end-to-end tests.
 

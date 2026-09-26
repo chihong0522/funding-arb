@@ -188,7 +188,7 @@ Scanner 的 net_edge 已扣除每腿 taker 手續費。費率解析邏輯位於 
 <!-- id: testing -->
 
 ```text
-pip install -r requirements.txt
+python3 -m pip install --require-hashes -r requirements.paper.lock
 .venv/bin/python -m pytest scripts/tests/ -q
-# 245+ tests — scanners, fees, venues, executor, backtest
+# Full existing suite — optional DEX SDKs are not required for paper tests.
 ```
